@@ -1,0 +1,30 @@
+# 每天自动同步上游仓库到你 fork 的 main 分支
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 每天 UTC 1 点（北京时间 9 点）执行
+  workflow_dispatch:        # 允许在 Actions 页面手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/Blinue/Magpie.git
+          git fetch upstream
+
+      - name: Merge upstream/main into main and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge upstream/main --no-edit
+          git push origin main
