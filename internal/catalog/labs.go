@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // LabsPath is where Sync keeps models.dev's lab catalog (models.json),
@@ -85,32 +86,7 @@ func syncLabs(ctx context.Context) error {
 	if err := json.Unmarshal(b, &probe); err != nil || len(probe) == 0 {
 		return fmt.Errorf("models.dev labs: unexpected payload")
 	}
-	p := LabsPath()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".labs-*.json")
-	if err != nil {
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
-		return err
-	}
-	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
-		os.Remove(tmp.Name())
-		return err
-	}
-	if err := os.Rename(tmp.Name(), p); err != nil {
-		os.Remove(tmp.Name())
-		return err
-	}
-	return nil
+	return writeWhole(LabsPath(), b, time.Time{})
 }
 
 // labsMissing says the provider catalog is magpie's own but no lab catalog
@@ -179,7 +155,7 @@ func Describe(id, name string) Model {
 	if x, ok := lookup(id, labs); ok {
 		m.ImageInput = imageInput(x.Modalities.Input)
 		m.Released, m.Temperature = x.ReleaseDate, x.Temperature
-		m.InputModalities, m.OutputModalities = x.Modalities.Input, x.Modalities.Output
+		m.InputModalities, m.OutputModalities = Kinds(x.Modalities.Input), Kinds(x.Modalities.Output)
 	}
 	return m
 }

@@ -36,6 +36,11 @@ type WSLHome struct {
 	Distro  string
 	Home    string
 	Running bool
+	// Open maps a path under Home to where it can be read from Windows:
+	// a folder that is a link in the distro (~/.codex → /mnt/c/…) can't
+	// be followed through \\wsl.localhost (#4502), so what is below it is
+	// read where the link leads. nil reads every path as it is.
+	Open func(string) string
 }
 
 // WSLHomes are the WSL distros to read sessions in; nil (none) unless
@@ -74,10 +79,13 @@ var wslAgents = []struct{ agent, dir string }{
 }
 
 // wslScan lists the session files under a distro's home.
-func wslScan(home string) []file {
+func wslScan(h WSLHome) []file {
 	var out []file
 	for _, a := range wslAgents {
-		dir := filepath.Join(home, a.dir)
+		dir := filepath.Join(h.Home, a.dir)
+		if h.Open != nil {
+			dir = h.Open(dir)
+		}
 		switch a.agent {
 		case "claude":
 			out = append(out, ccFiles("claude", dir)...)
@@ -198,7 +206,7 @@ func wslFiles(agents ...string) []file {
 		in := &fileMore{wsl: n} // the distro's files share it
 		for _, e := range l.Files {
 			if want[e.Agent] {
-				out = append(out, file{agent: e.Agent, key: e.Key, path: e.Path, main: e.Main, size: e.Size, mod: e.Mod, more: in, cold: cold})
+				out = append(out, file{agent: e.Agent, key: e.Key, path: e.Path, main: e.Main, size: e.Size, mod: modOf(e.Mod), more: in, cold: cold})
 			}
 		}
 	}
@@ -228,8 +236,8 @@ func wslList(gen uint64, done chan struct{}) {
 			continue
 		}
 		l := &wslListing{Home: h.Home, Running: true, Files: []wslEntry{}}
-		for _, f := range wslScan(h.Home) {
-			l.Files = append(l.Files, wslEntry{Agent: f.agent, Key: f.key, Path: f.path, Main: f.main, Size: f.size, Mod: f.mod})
+		for _, f := range wslScan(h) {
+			l.Files = append(l.Files, wslEntry{Agent: f.agent, Key: f.key, Path: f.path, Main: f.main, Size: f.size, Mod: f.mod.Time()})
 		}
 		lists[h.Distro] = l
 	}

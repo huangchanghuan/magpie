@@ -25,7 +25,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -37,6 +36,7 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/claudecode"
 	"github.com/yetone/magpie/internal/filelock"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
@@ -105,6 +105,11 @@ type Account struct {
 	// is one the account was refused (copilot_refused.go); and on a ZCode
 	// account on the Start Plan: whether it is one only the Coding Plan has.
 	unusable func(model string) bool
+	// listedOnly is set on a ChatGPT account: the backend serves none of
+	// the models its list leaves out ("The 'gpt-5.5' model is not
+	// supported when using Codex with a ChatGPT account", #4772), so a
+	// pick the fetched list doesn't have isn't offered.
+	listedOnly bool
 	// explain adds what the user can do about a refusal the account's
 	// backend answered, "" when there is nothing to add (factory.go).
 	explain func(status int, body []byte) string
@@ -128,10 +133,15 @@ type Account struct {
 // Claude models on Chat and Anthropic's. nil is not known, and every API
 // the provider speaks may be tried. One the user set for the model
 // (SetModelAPI) is the only one.
-func (p Provider) APIs(model string) []Protocol {
+func (p Provider) APIs(model string) []Protocol { return p.apisAmong(p.Speaks(), model) }
+
+// apisAmong is APIs with the protocols p speaks found already.
+func (p Provider) apisAmong(speaks []Protocol, model string) []Protocol {
 	// the one the user said it is asked on, whatever the list says
-	if proto, ok := p.ModelAPI(model); ok {
-		return []Protocol{proto}
+	if proto, ok := p.apiSet(model); ok {
+		if proto, ok := p.modelAPIAmong(len(speaks), proto); ok {
+			return []Protocol{proto}
+		}
 	}
 	return p.ListedAPIs(model)
 }
@@ -159,11 +169,15 @@ func (p Provider) ListedAPIs(model string) []Protocol {
 			return apis
 		}
 	}
-	// Vertex AI serves Gemini on generateContent, and its partner models
-	// (publisher/model) on chat completions alone
+	// Vertex AI serves Gemini on generateContent, its partner models
+	// (publisher/model) on chat completions alone, and Claude on
+	// Anthropic's Messages API alone
 	if p.IsVertex() {
 		if VertexPartner(model) {
 			return []Protocol{Chat}
+		}
+		if VertexClaude(model) {
+			return []Protocol{Anthropic}
 		}
 		return []Protocol{Gemini}
 	}
@@ -205,6 +219,9 @@ func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, b
 		return errAccountDiscoveryOff
 	}
 	ctx = p.Via(ctx) // a sign-in refreshed on the way goes through its proxy
+	// the agent's own headers the provider lists (PassHeaders), before an
+	// account's signing, which has the last word on its own
+	passed := p.passClientHeaders(ctx, req.Header)
 	if p.Account != nil && p.Account.sign != nil {
 		return p.Account.sign(ctx, req, body)
 	}
@@ -235,6 +252,9 @@ func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, b
 	// ${sessionId} and ${threadId} in a value are the conversation's
 	// (conversation.go).
 	for k, v := range p.SentHeaders(ctx) {
+		if slices.ContainsFunc(passed, func(n string) bool { return strings.EqualFold(n, k) }) {
+			continue // the agent sent its own, which stands over the user's fixed one
+		}
 		if ListHeader(k) {
 			MergeList(req.Header, k, v)
 			continue
@@ -398,6 +418,18 @@ type claudeAuth struct {
 	Scopes           []string `json:"scopes"`
 	SubscriptionType string   `json:"subscriptionType"`
 	RateLimitTier    string   `json:"rateLimitTier"`
+}
+
+// plan names the Claude subscription as Anthropic sells it now:
+// Max 20x is Claude Ultra, while Claude Code still says "max" for it
+// and tells the two apart only by the rate-limit tier.
+func (a claudeAuth) plan() string { return claudePlan(a.SubscriptionType, a.RateLimitTier) }
+
+func claudePlan(sub, tier string) string {
+	if sub == "max" && strings.Contains(tier, "max_20x") {
+		return "ultra"
+	}
+	return sub
 }
 
 // claudeCredentials keeps the whole credential blob in raw, so refreshing a
@@ -586,7 +618,7 @@ func claudeKeychainAccount() string {
 	return name
 }
 
-var keychainAccountRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+var keychainAccountRe = lazyre.New(`^[a-zA-Z0-9._-]+$`)
 
 // keychainText undoes `security find-generic-password -w` printing a
 // password with a character it can't print — a newline — as hex.
@@ -791,9 +823,9 @@ func claudeAccount() (Provider, bool) {
 	if signedOut {
 		return claudeStandInAccount()
 	}
-	plan := c.OAuth.SubscriptionType
+	plan := c.OAuth.plan()
 	if statusPlan != "" {
-		plan = statusPlan
+		plan = claudePlan(statusPlan, c.OAuth.RateLimitTier)
 	}
 	// named as its saved login is (liveLogin): it is then the account Logins
 	// flags Active, not served a second time beside itself, and its
@@ -847,7 +879,10 @@ func claudeProvider(acct *Account) Provider {
 	// Claude's models are the ones magpie knows and the ones Claude Code
 	// was told an account has (claude_models.go): listing them would ask
 	// Anthropic with the account's sign-in, which magpie never does
-	acct.fetch = func(context.Context) ([]catalog.Model, error) {
+	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
+		// models.dev's list, fetched again first when it is older than
+		// a few minutes: a model launched since the day's sync is listed
+		catalog.Asked(ctx)
 		ms := claudeModels()
 		return ms, catalog.SaveLive("claude", claudeBase, ms)
 	}
@@ -1040,12 +1075,13 @@ func codexAccount(home string) (Provider, bool) {
 	}
 	acct.body = codexBody
 	acct.models = catalog.Codex
+	acct.listedOnly = true
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
-		ms, err := codexModels(ctx, acct.sign)
+		ms, ver, err := codexModelsAsked(ctx, acct.sign)
 		if err != nil {
 			return nil, err
 		}
-		catalog.SaveLive(accountModels("codex", acct.User), CodexBase, ms)
+		catalog.SaveLiveAsked(accountModels("codex", acct.User), CodexBase, ver, ms)
 		codexFetchSaved(ctx)
 		ms = codexPoolModels(ms)
 		return ms, catalog.SaveLive("codex", CodexBase, ms)
@@ -1148,6 +1184,18 @@ func codexTokenRenewing(ctx context.Context, dir, stale string) (tok, accountID 
 	// moment on Windows is waited out (#2239, #1505). A write that still
 	// fails loses the rotation, said in the log; the fresh access token in
 	// hand still serves this request.
+	//
+	// Only over the sign-in this refresh started from, though. The refresh
+	// is a network round trip, and the store may hold another sign-in by
+	// now: Codex signed in to another account (the Codex app's own
+	// sign-in, or a magpie outside codexMu), or signed out. Writing the
+	// refreshed one over it switched Codex back to the account it had
+	// been switched off (darwish4021 on Discord: "switched my account").
+	// The fresh access token still serves the request in hand.
+	if now, _, err := readCodexLogin(dir, true); err != nil || !sameRefreshToken(now, a.Tokens.RefreshToken) {
+		log.Printf("codex: the sign-in in %s changed while %s was being refreshed; the refresh is not written over it", dir, accountID)
+		return tok, accountID, nil
+	}
 	if out, err := json.MarshalIndent(raw, "", "  "); err == nil {
 		if werr := st.write(out); werr != nil {
 			where := st.file()
@@ -1200,6 +1248,13 @@ func forcedReason(ctx context.Context) string {
 // body of client_id, grant_type, refresh_token and refresh_reason, with
 // no scope (a refresh keeps the scopes granted), and Codex's originator
 // and User-Agent.
+// sameRefreshToken says the sign-in b still holds refresh, the refresh
+// token a refresh started from.
+func sameRefreshToken(b []byte, refresh string) bool {
+	var a codexAuth
+	return json.Unmarshal(b, &a) == nil && refresh != "" && a.Tokens.RefreshToken == refresh
+}
+
 func codexRefresh(ctx context.Context, raw map[string]any, reason string) (string, error) {
 	toks, _ := raw["tokens"].(map[string]any)
 	if toks == nil {
@@ -1226,7 +1281,7 @@ func codexRefresh(ctx context.Context, raw map[string]any, reason string) (strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 	codexClientHeaders(req.Header, codexVersion())
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return "", errors.New("Codex token refresh: " + err.Error())
 	}
@@ -1238,7 +1293,7 @@ func codexRefresh(ctx context.Context, raw map[string]any, reason string) (strin
 		RefreshToken string `json:"refresh_token"`
 	}
 	if res.StatusCode != 200 || json.Unmarshal(b, &fresh) != nil || fresh.AccessToken == "" {
-		err := refreshFailed(res.StatusCode, "Codex", "Codex is signed out (token refresh failed); run codex login")
+		err := refreshFailed(res.StatusCode, "Codex", "Codex is signed out (token refresh failed); sign in to this account again")
 		if res.StatusCode != 200 && codexRefreshGone(res.StatusCode, b) {
 			// refused for good, by Codex's own rule (#4308)
 			err = codexRefreshGoneError{err}
@@ -1523,6 +1578,8 @@ func copilotProvider(app copilotApp, plan string) Provider {
 		if err != nil {
 			return nil, err
 		}
+		// with what the other accounts' plans add (copilot_pool.go)
+		ms = copilotPoolModels(ctx, acct.User, ms)
 		return ms, catalog.SaveLive("copilot", copilotBase, ms)
 	}
 	// each model is served on some of these: the newest GPT models on
@@ -1614,7 +1671,7 @@ func copilotToken(ctx context.Context, app copilotApp) (copilotSession, error) {
 	for k, v := range copilotHeaders {
 		req.Header.Set(k, v)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return copilotSession{}, errors.New("Copilot sign-in: " + err.Error())
 	}
@@ -1650,7 +1707,7 @@ func copilotAPIs(endpoints []string) []string {
 }
 
 // internal is a Copilot model id nobody picks by hand.
-var copilotInternal = regexp.MustCompile(`^(copilot-search|exec-agent|trajectory)|-(secondary|tertiary|4th|free-auto)$`)
+var copilotInternal = lazyre.New(`^(copilot-search|exec-agent|trajectory)|-(secondary|tertiary|4th|free-auto)$`)
 
 // A model Copilot offers with terms of its own stays disabled until the
 // account accepts them, as VS Code does when one is first picked; magpie
@@ -1692,7 +1749,7 @@ func copilotAccept(ctx context.Context, app copilotApp, s copilotSession, model 
 	for k, v := range s.headers() {
 		req.Header.Set(k, v)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return
 	}
@@ -1723,7 +1780,7 @@ func copilotModels(ctx context.Context, app copilotApp) ([]catalog.Model, error)
 	for k, v := range s.headers() {
 		req.Header.Set(k, v)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1769,11 +1826,22 @@ func copilotModels(ctx context.Context, app copilotApp) ([]catalog.Model, error)
 	}
 	copilotSeenMu.Unlock()
 	for _, m := range v.Data {
-		if m.Capabilities.Type != "chat" || copilotInternal.MatchString(m.ID) || m.Vendor == "Experimental" {
+		if copilotDrawsModel(m.Capabilities.Type, m.ID) && !copilotInternal.MatchString(m.ID) {
+			// an image model (GPT Image 2.5 Flare in Copilot CLI): drawn at
+			// the account's /images API, never offered to an agent's chat
+			if m.Policy == nil || m.Policy.State == "enabled" {
+				out = append(out, catalog.Model{ID: m.ID, Name: m.Name, Draws: true})
+			}
 			continue
 		}
-		// a model no picker offers is an old snapshot or Copilot's own
-		if !m.Picker && m.Category == "" {
+		if m.Capabilities.Type != "chat" || copilotInternal.MatchString(m.ID) {
+			continue
+		}
+		// a model no picker offers is an old snapshot or Copilot's own; an
+		// Experimental vendor's is Copilot's own too, unless the picker
+		// offers it (#4343: mai-code-2-flash, an Enterprise account's,
+		// served on /responses)
+		if !m.Picker && (m.Category == "" || m.Vendor == "Experimental") {
 			continue
 		}
 		switch {
@@ -1824,4 +1892,17 @@ func forgetClaudeStatus() {
 	claudeStatusGen++
 	claudeStatusBusy = false
 	claudeStatusMu.Unlock()
+}
+
+// copilotDrawsModel is whether a /models entry of capabilities.type typ is
+// an image model: Copilot types it for images, or it isn't a chat, embedding
+// or other known type and its id names images.
+func copilotDrawsModel(typ, id string) bool {
+	switch strings.ToLower(typ) {
+	case "image", "images", "image_generation", "image-generation":
+		return true
+	case "chat", "embeddings", "embedding", "completion", "completions":
+		return false
+	}
+	return catalog.DrawsID(id)
 }

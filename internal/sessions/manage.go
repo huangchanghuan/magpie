@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -26,7 +27,12 @@ import (
 // DeepSeek Harness's (a session's folder, and its listing's cached row) and
 // Droid's (a transcript and its .settings.json, and its subagents'; Droid's
 // own session index is a cache it rebuilds from those files, as it does
-// when it deletes an empty draft itself; zachzhao1984 on Discord).
+// when it deletes an empty draft itself; zachzhao1984 on Discord) and
+// Antigravity CLI's (agy: a conversation's brain folder, conversations/<id>.db
+// and annotations/<id>.pbtxt, what agy's own delete removes; ysm119 on
+// Discord). agy's conversation_summaries.db and jetbox_summaries_proto.pb,
+// which it keeps open, keep the row, and agy lists no conversation whose
+// files are gone, as a restore brings it back to its /resume list.
 // Hermes's and Alma's are rows in a database the agent keeps open and
 // writes, so they are only listed, and so are OpenCode's and ZCode's, and
 // Cline's, whose sessions.db lists a session whose files are gone. Grok
@@ -49,6 +55,11 @@ type Managed struct {
 	Messages  int   `json:"messages"`
 	Files     int   `json:"files"`
 	Deletable bool  `json:"deletable"`
+	// Undeletable: why a session of an agent whose sessions can be deleted
+	// can't be: "cursor-editor", a chat Cursor's editor keeps in its own
+	// database, or "read-only" (rowDeletable). The page says it on the
+	// row's delete, never by leaving the control out (ysm119 on Discord).
+	Undeletable string `json:"undeletable,omitempty"`
 	// Pending: a file of it is still being read for the first time, and
 	// what it spent and its messages aren't counted yet (the Sessions page
 	// answers before such a read, manage_quick.go)
@@ -70,10 +81,32 @@ type AgentCount struct {
 // those kept as files of their own, in a layout magpie knows whole.
 func Deletable(agent string) bool {
 	switch agent {
-	case "claude", "qoder", "qoder-cn", "workbuddy", "codebuddy", "codex", "pi", "raft", "omp", "cursor", "dsh", "droid":
+	case "claude", "qoder", "qoder-cn", "workbuddy", "workbuddy-ai", "codebuddy", "codex", "pi", "raft", "cindy", "omp", "cursor", "dsh", "droid", "agy":
 		return true
 	}
 	return false
+}
+
+// rowDeletable says whether one session of an agent can be moved to the
+// trash, and, for one that can't of an agent whose sessions can, why. A
+// read-only session can't, except a Cursor editor transcript whose chat
+// the editor keeps no longer (fileMore.loose): it is files of its own.
+func rowDeletable(agent string, s Session, fs []file) (bool, string) {
+	if !Deletable(agent) {
+		return false, ""
+	}
+	if !s.ReadOnly {
+		return true, ""
+	}
+	if agent != "cursor" {
+		return false, "read-only"
+	}
+	for _, f := range fs {
+		if f.readOnly && !f.m().loose {
+			return false, "cursor-editor"
+		}
+	}
+	return true, ""
 }
 
 // ActiveWindow is how recently a session's file may have been written for
@@ -123,13 +156,16 @@ func agentCounts(all []file) []AgentCount {
 // ListAgent is every session of one agent, the most recently active first,
 // with no limit; one nothing was said in is listed too, to be cleared away.
 func ListAgent(agent string) []Managed {
+	alias := provider.UsageAlias()
 	storeMu.RLock()
 	defer storeMu.RUnlock()
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
 	defer useDBs()()
-	return listAgent(agent, allFiles())
+	out := listAgent(agent, allFiles())
+	aliasManaged(out, alias)
+	return out
 }
 
 // NativeIDs are the ids of every session the agents named keep themselves,
@@ -164,6 +200,7 @@ type ManageView struct {
 // Only native's agents and the one picked are read: a change to another
 // agent's sessions waits for a page that shows it (#2776).
 func Manage(native map[string]bool, pick func([]AgentCount, map[string]map[string]bool) string) ManageView {
+	alias := provider.UsageAlias()
 	storeMu.RLock()
 	defer storeMu.RUnlock()
 	mu.Lock()
@@ -175,6 +212,7 @@ func Manage(native map[string]bool, pick func([]AgentCount, map[string]map[strin
 	v.Agent = pick(v.Agents, v.Native)
 	if v.Agent != "" {
 		v.Sessions = listAgentWith(v.Agent, all, true)
+		aliasManaged(v.Sessions, alias)
 	}
 	return v
 }
@@ -190,10 +228,13 @@ func readFor(want, all []file, quick bool) (pending map[string]bool, done func()
 }
 
 // idInFile says which agents' session ids are read from inside the
-// session's file, not taken from its name (as assemble does).
+// session's file, not taken from its name (as assemble does). ZCode's are:
+// its database rows are the files, a fork's and a subagent's filed under
+// the session they ran in (ocRoots), which a request names by their own ids
+// (subIDs, zcodeBareID).
 func idInFile(agent string) bool {
 	switch agent {
-	case "codex", "pi", "raft", "omp", "dsh", "grok", "droid":
+	case "codex", "pi", "raft", "cindy", "omp", "dsh", "grok", "droid", "zcode":
 		return true
 	}
 	return false
@@ -225,7 +266,14 @@ func nativeIDsWith(agents map[string]bool, all []file, quick bool) map[string]ma
 	for _, fs := range groups {
 		id := sessionID(fs)
 		if a := fs[0].agent; agents[a] {
-			out[a][id] = true
+			// by every id a request can name it (requestIDs, as
+			// GatewayKeys), its subagents' too: their calls are counted in
+			// it (subIDs)
+			for _, sid := range append([]string{id}, subIDs(fs, id)...) {
+				for _, rid := range requestIDs(a, sid) {
+					out[a][rid] = true
+				}
+			}
 		}
 		if fs[0].agent == "raft" && agents["pi"] {
 			out["pi"][id] = true
@@ -269,7 +317,8 @@ func listAgentWith(agent string, all []file, quick bool) []Managed {
 		setSessionCodexTaskTitle(&s, taskTitles)
 		listed(&s)
 		// a WSL distro's too (TJHHHH): moved out over \\wsl.localhost
-		m := Managed{Session: s, Files: len(fs), Deletable: Deletable(agent) && !s.ReadOnly}
+		m := Managed{Session: s, Files: len(fs)}
+		m.Deletable, m.Undeletable = rowDeletable(agent, s, fs)
 		for _, f := range fs {
 			m.Size += f.size
 			m.Pending = m.Pending || pending[f.path]
@@ -382,7 +431,10 @@ func Delete(agent, id string) (Trashed, error) {
 	if len(fs) == 0 {
 		return Trashed{}, errors.New("no such session")
 	}
-	if s.ReadOnly {
+	if ok, why := rowDeletable(agent, s, fs); !ok {
+		if why == "cursor-editor" {
+			return Trashed{}, errors.New("Cursor's editor keeps this chat in its own database: delete it in Cursor")
+		}
 		return Trashed{}, errors.New("this session is read only")
 	}
 	paths := sessionPaths(agent, id, fs)
@@ -406,6 +458,11 @@ func Delete(agent, id string) (Trashed, error) {
 		if recent(p, now) {
 			return Trashed{}, ErrActive
 		}
+	}
+	// agy holds a conversation's presence lock while it has it open, idle
+	// for longer than a minute too
+	if agent == "agy" && agyHeld(filepath.Join(agyDataDir(fs), "presence", id+".lock")) {
+		return Trashed{}, ErrActive
 	}
 	t := Trashed{Agent: agent, ID: id, Title: s.Title, Cwd: s.Cwd, Last: s.Last, Deleted: now}
 	name := now.UTC().Format("20060102T150405.000000000") + "-" + id
@@ -468,6 +525,13 @@ func sessionPaths(agent, id string, fs []file) []string {
 		// transcripts Cursor wrote of it
 		cwd := ""
 		for _, f := range fs {
+			if f.readOnly {
+				// an editor transcript, never the folder it is in
+				for _, p := range cursorEditorPaths(f, id) {
+					add(p)
+				}
+				continue
+			}
 			add(filepath.Dir(f.path))
 			if st := cache[f.path]; st != nil && f.main {
 				cwd = st.Cwd
@@ -476,6 +540,22 @@ func sessionPaths(agent, id string, fs []file) []string {
 		for _, p := range cursorTranscripts(cwd, id) {
 			add(p)
 		}
+		return out
+	}
+	if agent == "agy" {
+		// what agy's own delete (its /resume picker) removes: the
+		// conversation's brain folder, its trajectory database with the
+		// journal files SQLite keeps beside it, and its annotations
+		dir := agyDataDir(fs)
+		if dir == "" {
+			return nil
+		}
+		add(filepath.Join(dir, "brain", id))
+		db := filepath.Join(dir, "conversations", id+".db")
+		for _, p := range []string{db, db + "-wal", db + "-shm", db + "-journal"} {
+			add(p)
+		}
+		add(filepath.Join(dir, "annotations", id+".pbtxt"))
 		return out
 	}
 	if agent == "dsh" {
@@ -502,7 +582,7 @@ func sessionPaths(agent, id string, fs []file) []string {
 			}
 			// the folder beside it: a Claude Code session's subagents and
 			// tool results, an omp session's artifacts
-			if agent != "codex" && agent != "pi" && agent != "raft" {
+			if agent != "codex" && agent != "pi" && agent != "raft" && agent != "cindy" {
 				if d := strings.TrimSuffix(f.path, ".jsonl"); d != f.path {
 					if fi, err := os.Stat(d); err == nil && fi.IsDir() {
 						add(d)
@@ -668,6 +748,11 @@ func Trash() []Trashed {
 		if err != nil || json.Unmarshal(b, &t) != nil {
 			continue
 		}
+		// gateway mode lists what the gateway kept, not this computer's
+		// agents' sessions (OwnOff)
+		if !t.Gateway && ownOff() {
+			continue
+		}
 		dir := filepath.Dir(p)
 		t.Key = filepath.Base(filepath.Dir(dir)) + "/" + filepath.Base(dir)
 		if t.Gateway {
@@ -698,6 +783,9 @@ func Purge(key string) error {
 	if dir == "" {
 		return errors.New("no such deleted session")
 	}
+	if !isGatewayKey(key) && ownOff() {
+		return ErrNotRead
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	for _, p := range []string{filepath.Dir(dir), dir} {
@@ -724,6 +812,9 @@ func Restore(key string) (Trashed, error) {
 		return Trashed{}, errors.New("no such deleted session")
 	}
 	t.Key = key
+	if !isGatewayKey(key) && ownOff() {
+		return Trashed{}, ErrNotRead
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if isGatewayKey(key) {

@@ -192,6 +192,29 @@ func callerGroups(s usage.Summary) []Group {
 	return keys
 }
 
+// inKeyOrder puts the Gateway key filter's keys in the order the user
+// gave the keys on the Gateway page (alextjy on Discord), not by what each
+// used: a key removed since, which the store no longer lists, goes after
+// them, in the order it came. The Overview's list stays a ranking.
+func inKeyOrder(groups []Group) []Group {
+	current, err := access.List()
+	if err != nil {
+		return groups
+	}
+	place := make(map[string]int, len(current))
+	for i, k := range current {
+		place[k.ID] = i
+	}
+	at := func(g Group) int {
+		if i, ok := place[g.CallerKeyID]; ok {
+			return i
+		}
+		return len(current)
+	}
+	slices.SortStableFunc(groups, func(a, b Group) int { return at(a) - at(b) })
+	return groups
+}
+
 // PeriodOf is the period a ?period= names: a preset, or days picked as
 // "2026-10-01..2026-10-07" (#1492); 30 days for anything else.
 func PeriodOf(s string) usage.Period {
@@ -201,9 +224,12 @@ func PeriodOf(s string) usage.Period {
 	return usage.Month
 }
 
+// FilterOf is the filter a request's query names. A found routing group's
+// model is taken as magpie keeps it (group/auto-…), as the menu offers it
+// by its public auto/<model>, so either id picks the group's calls.
 func FilterOf(q url.Values) usage.Filter {
 	id, _ := strconv.ParseInt(q.Get("route"), 10, 64)
-	return usage.Filter{Day: q.Get("day"), RouteID: id, Model: q.Get("model"), Agent: q.Get("agent"), Provider: q.Get("provider"), Purpose: q.Get("purpose"), Account: q.Get("account"), CallerKey: q.Get("callerKey"), Failed: q.Get("failed") == "1", Retried: q.Get("retried") == "1", Query: q.Get("q"), Computer: q.Get("computer"), Through: viaOf(q.Get("via"))}
+	return usage.Filter{Day: q.Get("day"), RouteID: id, Model: provider.CanonicalRef(q.Get("model")), Agent: q.Get("agent"), Provider: q.Get("provider"), Purpose: q.Get("purpose"), Account: q.Get("account"), CallerKey: q.Get("callerKey"), Failed: q.Get("failed") == "1", Retried: q.Get("retried") == "1", Query: q.Get("q"), Computer: q.Get("computer"), Through: viaOf(q.Get("via"))}
 }
 
 // viaOf is the source a request's ?via= names, "" for both.
@@ -226,6 +252,9 @@ type Row struct {
 	PricingModel   string `json:"pricing_model,omitempty"`
 	// ComputerName is the other computer a call was made on, shared through sync (#542)
 	ComputerName string `json:"computerName,omitempty"`
+	// Canceled: its agent canceled it before it was answered
+	// (usage.Record.Canceled), which the page shows as no failure
+	Canceled bool `json:"canceled,omitempty"`
 }
 
 type Ledger struct {
@@ -328,22 +357,19 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	out.Bucket, out.Series = l.Bucket, l.Series
 	out.Purposes = l.Purposes
 	out.Day = f.Day
-	out.CallerKeys = callerGroups(usage.Summary{CallerKeys: l.CallerKeys})
+	out.CallerKeys = inKeyOrder(callerGroups(usage.Summary{CallerKeys: l.CallerKeys}))
 	callerLabels := map[string]string{}
 	for _, g := range out.CallerKeys {
 		callerLabels[g.CallerKeyID] = g.Name
 	}
 	// a group magpie found is named as agents pick it, auto/<model>; the
 	// ledger keeps group/auto-<slug> (provider.CanonicalRef)
-	pub := map[string]string{}
+	pub := provider.PublicRefs()
 	for _, r := range page {
 		a := who(r.Agent)
-		lr := Row{Row: r, AgentName: a.Name, Icon: a.Icon, ProviderName: which(r.Provider).Name}
-		if req := r.Requested; strings.HasPrefix(req, provider.GroupPrefix) {
-			if _, ok := pub[req]; !ok {
-				pub[req] = provider.PublicRef(req)
-			}
-			lr.Requested = pub[req]
+		lr := Row{Row: r, AgentName: a.Name, Icon: a.Icon, ProviderName: which(r.Provider).Name, Canceled: r.Canceled()}
+		if pub != nil {
+			lr.Model, lr.Requested = pub(r.Model), pub(r.Requested)
 		}
 		if r.Source != "log" && r.Source != usage.SourceReported {
 			lr.Access = access[r.Provider]
@@ -373,7 +399,7 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	at := map[string]int{}
 	for _, g := range l.Accounts {
 		name := which(g.Provider).Name
-		own := provider.AccountNameOf(g.Provider, g.Account)
+		own := provider.AccountLabelOf(g.Provider, g.Account)
 		if i, ok := at[g.Account]; ok {
 			a := &out.Accounts[i]
 			if !slices.Contains(a.Providers, name) {

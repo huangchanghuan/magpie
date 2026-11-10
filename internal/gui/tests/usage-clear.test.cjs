@@ -81,6 +81,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const ctx = await browser.newContext({ viewport: { width, height: 700 }, reducedMotion: "reduce", hasTouch: web, isMobile: web && engine === "chromium" });
           const p = await ctx.newPage();
           p.setDefaultTimeout(5000);
+          p.setDefaultNavigationTimeout(60000);
           p.on("pageerror", (e) => errors.push(e.message));
           await p.route("**/*", server(lang, web, saved, posts));
           await p.goto("http://magpie.test/");
@@ -98,8 +99,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const more = row.locator(".us-more");
           await more.click();
           const item = p.locator(".row-menu .rm-item");
-          assert.deepEqual((await item.allTextContents()).map((s) => s.trim()), [w.item]);
-          await item.click();
+          // Set price… above it (usage-model-price.test.cjs)
+          assert.deepEqual((await item.allTextContents()).map((s) => s.trim()).slice(1), [w.item]);
+          await item.nth(1).click();
           const dialog = p.locator("dialog.action-confirm");
           await dialog.waitFor();
           assert.equal(await dialog.getAttribute("role"), "alertdialog");

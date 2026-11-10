@@ -2,7 +2,9 @@ package update
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +22,8 @@ import (
 //
 // It is written wherever a terminal runs magpie from: when the app's
 // folder is on PATH, where Settings › Command line puts it, or a magpie.com
-// or magpie.cmd is there already. The app writes it again as it starts
+// or magpie.cmd is there already. On the Desktop or in Downloads only Add
+// writes it, and a start only keeps one there up to date. The app writes it again as it starts
 // when its bytes differ, so an update brings it along. They differ only
 // when the launcher does: it is built without the release's commit in it
 // (the Makefile's -buildvcs=false), or every update wrote a new magpie.com
@@ -101,11 +104,21 @@ func comOwner(exe string) bool {
 // magpie.cmd there), or brings one there up to this version. Nothing in
 // a build without the launcher, or when it is as it should be already.
 func EnsureCompanion(exe string) error {
-	if comLauncher == nil || !comOwner(exe) {
+	// a download that opens the installed magpie (Settle) leaves the
+	// command to that one, in its folder on PATH
+	if comLauncher == nil || !comOwner(exe) || forwards(exe) {
 		return nil
 	}
 	dir := filepath.Dir(exe)
-	if !onPath(dir, os.Getenv("PATH")) && !exists(filepath.Join(dir, comName)) && !exists(filepath.Join(dir, shimName)) {
+	if downloadFolder(dir) {
+		// the Desktop or Downloads, which the user sees: one there is
+		// kept up to date, never put back once deleted (nianshou5 on
+		// Discord: it came back on every start, the Desktop being on
+		// PATH). Settings › Command line's Add still writes it.
+		if !exists(filepath.Join(dir, comName)) {
+			return nil
+		}
+	} else if !onPath(dir, os.Getenv("PATH")) && !exists(filepath.Join(dir, comName)) && !exists(filepath.Join(dir, shimName)) {
 		return nil
 	}
 	_, err := writeCom(comLauncher, exe)
@@ -158,7 +171,27 @@ func onPath(dir, path string) bool {
 	return false
 }
 
+// exists is whether p is there and could be looked at: false too when
+// that is unknown. Anything that makes, moves over or removes on its
+// answer asks present instead, which tells unknown apart.
 func exists(p string) bool {
-	_, err := os.Stat(p)
+	_, err := statPath(p)
 	return err == nil
 }
+
+// present is whether p is there: an error when that is unknown (Stat
+// failed for a reason other than its not being there, such as a folder
+// that may not be looked into).
+func present(p string) (bool, error) {
+	_, err := statPath(p)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	}
+	return false, err
+}
+
+// statPath is os.Stat; tests make it fail.
+var statPath = os.Stat

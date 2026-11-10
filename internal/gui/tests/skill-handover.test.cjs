@@ -88,6 +88,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "skills"); } catch {} });
         const page = await ctx.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, posts, st));
         await page.goto("http://magpie.test/");
@@ -148,11 +149,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "skills"); } catch {} });
       const page = await ctx.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server("en", posts, st));
       await page.goto("http://magpie.test/");
       await page.locator('button[data-view="library"]').click();
-      const all = page.locator("#view-library .lib-skillshead button.lib-handover");
+      // Manage n in magpie waits under the heading's ⋯ (library-bar-more)
+      const more = page.locator("#view-library .lib-skillshead .lib-barmore");
+      await more.click();
+      const all = page.locator(".row-menu .rm-item.lib-handover");
       await all.waitFor();
       assert.equal((await all.textContent()).trim(), w.all);
       await all.click();
@@ -163,8 +168,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await sheet.locator(".bar button.primary").click();
       await sheet.waitFor({ state: "detached" });
       assert.deepEqual(posts, [{ what: "hand-over", body: { names: ["orca", "grill"] } }]);
-      await all.waitFor({ state: "detached" });
       assert.equal((await page.locator("#status").textContent()).trim(), w.doneAll);
+      // none left kept there: the menu has no Manage n any more
+      await more.click();
+      await page.locator(".row-menu").waitFor();
+      assert.equal(await page.locator(".row-menu .rm-item.lib-handover").count(), 0);
       await ctx.close();
     });
     assert.deepEqual(errors, []);

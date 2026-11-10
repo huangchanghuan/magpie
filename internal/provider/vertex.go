@@ -40,7 +40,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -49,6 +48,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // VertexPreset is the preset's id.
@@ -97,10 +97,10 @@ func (v *Vertex) Normal() *Vertex {
 var (
 	// a project's id (my-project-123), its number, or a domain-scoped
 	// one's (example.com:my-project)
-	vertexProject = regexp.MustCompile(`^[a-z0-9][a-z0-9.:-]*[a-z0-9]$`)
+	vertexProject = lazyre.New(`^[a-z0-9][a-z0-9.:-]*[a-z0-9]$`)
 	// global, us, eu or a region (us-central1, europe-west4)
-	vertexLocation = regexp.MustCompile(`^[a-z]+(-[a-z0-9]+)*$`)
-	vertexAccount  = regexp.MustCompile(`^[^\s@/]+@[^\s@/]+$`)
+	vertexLocation = lazyre.New(`^[a-z]+(-[a-z0-9]+)*$`)
+	vertexAccount  = lazyre.New(`^[^\s@/]+@[^\s@/]+$`)
 )
 
 // check is why a Vertex AI provider with v can't be saved, nil when it can.
@@ -183,6 +183,77 @@ func VertexPath(model string) string {
 // id on generateContent has one, so the slash is what tells them apart.
 func VertexPartner(model string) bool { return strings.Contains(model, "/") }
 
+// VertexClaude is whether model is one of Anthropic's Claude models on
+// Vertex AI (claude-opus-5-5, claude-sonnet-4-5@20250929), which Google
+// serves on Anthropic's own Messages API at the project, under the
+// anthropic publisher (VertexClaudeRequest), not on generateContent or
+// chat completions. The id alone says so, as the slash says a partner
+// model's: no Gemini id starts so, and Claude's ids have no publisher
+// before a slash.
+func VertexClaude(model string) bool {
+	return !VertexPartner(model) && strings.HasPrefix(strings.ToLower(model), "claude-")
+}
+
+// vertexAnthropicVersion is the Messages API's version a Claude request
+// on Vertex AI names in its body, where Anthropic's own takes the
+// anthropic-version header; Anthropic's Vertex SDK puts it there when the
+// body has none.
+const vertexAnthropicVersion = "vertex-2023-10-16"
+
+// VertexClaudeRequest is where at a Vertex AI provider (under its
+// Base(Anthropic)), and with what body, a request made for Anthropic's
+// Messages API at path (/v1/messages, its count_tokens, with or without
+// ?beta=true) goes, as Anthropic's Vertex SDK asks it: a message at
+// /publishers/anthropic/models/<model>:streamRawPredict when it streams,
+// :rawPredict when it doesn't, the model taken out of the body since the
+// path names it; a count at the publisher's count-tokens:rawPredict, the
+// model kept in the body. Either body names anthropic_version
+// (vertex-2023-10-16) unless it has one. ok is false for a body with no
+// model, which has no path.
+func VertexClaudeRequest(path string, body []byte) (string, []byte, bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return "", body, false
+	}
+	var model string
+	if json.Unmarshal(m["model"], &model) != nil || model == "" {
+		return "", body, false
+	}
+	if _, has := m["anthropic_version"]; !has {
+		m["anthropic_version"] = json.RawMessage(`"` + vertexAnthropicVersion + `"`)
+	}
+	at := "/publishers/anthropic/models/"
+	if p, _, _ := strings.Cut(path, "?"); strings.HasSuffix(p, "/count_tokens") {
+		at += "count-tokens:rawPredict"
+	} else {
+		var stream bool
+		_ = json.Unmarshal(m["stream"], &stream)
+		verb := ":rawPredict"
+		if stream {
+			verb = ":streamRawPredict"
+		}
+		at += url.PathEscape(model) + verb
+		delete(m, "model")
+	}
+	out, err := marshalRaw(m)
+	if err != nil {
+		return "", body, false
+	}
+	return at, out, true
+}
+
+// marshalRaw is m as JSON, its values byte for byte as they came (no
+// HTML escaping of a value's <, > and &).
+func marshalRaw(m map[string]json.RawMessage) ([]byte, error) {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		return nil, err
+	}
+	return []byte(strings.TrimSuffix(b.String(), "\n")), nil
+}
+
 // VertexWholePath is where a request for model answered as one JSON body
 // goes.
 func VertexWholePath(model string) string {
@@ -211,7 +282,7 @@ func vertexTest(q Provider, model string) (string, string) {
 
 // vertexGen is the major version a Gemini id names: gemini-4-argon,
 // gemini-3.8-flash.
-var vertexGen = regexp.MustCompile(`^gemini-(\d+)`)
+var vertexGen = lazyre.New(`^gemini-(\d+)`)
 
 // vertexGeneration is the Gemini generation model names, 0 for an id that
 // names none (an alias such as gemini-flash-latest, which may be a 2.5).
@@ -499,7 +570,7 @@ func (c googleCreds) mint(ctx context.Context, top bool) (string, time.Time, err
 // impersonationURL is gcloud's …/serviceAccounts/<email>:generateAccessToken,
 // whose email is asked for at IAM Credentials: the token never goes to the
 // host the file names.
-var impersonationURL = regexp.MustCompile(`/serviceAccounts/([^/:]+):generateAccessToken$`)
+var impersonationURL = lazyre.New(`/serviceAccounts/([^/:]+):generateAccessToken$`)
 
 // impersonated is the service account an impersonated_service_account
 // file's URL names, "" for another kind.
@@ -523,7 +594,7 @@ func (e personRefused) Unwrap() error { return e.error }
 
 // legacyADC is the file gcloud keeps a signed-in account's credentials in
 // for other tools, under its folder: legacy_credentials/<account>/adc.json.
-var legacyADC = regexp.MustCompile(`^legacy_credentials/([^/]+)/adc\.json$`)
+var legacyADC = lazyre.New(`^legacy_credentials/([^/]+)/adc\.json$`)
 
 // signInAgain says how the person's sign-in in file is made anew: gcloud
 // writes its own files again, as they were made (impersonating account,

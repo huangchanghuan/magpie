@@ -25,8 +25,49 @@ var keptStats struct {
 	// the answers the reads got from the prices, Codex's names and Claude
 	// Desktop's, asked again before the ranges are given out
 	prices  map[string]*catalog.Price
-	titles  map[string]string
+	titles  titleAnswers
 	desktop map[string]string
+}
+
+// titleAnswers are the answers a titles func gave, to be asked again
+// (keptStill). Nearly every id has no title, and a map of every session's
+// id held 3MB for a history of 18k files (#2278): an id answered "" is
+// only listed, sorted and without repeats once settled.
+type titleAnswers struct {
+	named map[string]string
+	none  []string
+}
+
+func (a *titleAnswers) note(id, t string) {
+	if t == "" {
+		a.none = append(a.none, id)
+		return
+	}
+	if a.named == nil {
+		a.named = map[string]string{}
+	}
+	a.named[id] = t
+}
+
+// settle sorts none and drops its repeats, and its slack.
+func (a *titleAnswers) settle() {
+	slices.Sort(a.none)
+	a.none = slices.Clip(slices.Compact(a.none))
+}
+
+// still reports whether titles answers each id as it did.
+func (a *titleAnswers) still(titles func(string) string) bool {
+	for id, t := range a.named {
+		if titles(id) != t {
+			return false
+		}
+	}
+	for i, id := range a.none {
+		if (i == 0 || id != a.none[i-1]) && titles(id) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // keptFile is what of a listed file a range's stats are made from: its
@@ -50,38 +91,48 @@ func keptFileOf(f file) keptFile {
 // they weren't, what was kept is let go.
 func keptFor(files []file, today time.Time, price func(string) *catalog.Price, titles func(string) string) bool {
 	k := &keptStats
-	same := k.ranges != nil && k.gen == cacheGeneration && k.today.Equal(today) && len(k.files) == len(files)
-	for i := 0; same && i < len(files); i++ {
-		same = k.files[i] == keptFileOf(files[i])
-	}
-	for model, p := range k.prices {
-		if !same {
-			break
-		}
-		same = reflect.DeepEqual(price(model), p)
-	}
-	for id, t := range k.titles {
-		if !same {
-			break
-		}
-		same = titles(id) == t
-	}
-	if same && len(k.desktop) > 0 {
-		ids := make([]string, 0, len(k.desktop))
-		for id := range k.desktop {
-			ids = append(ids, id)
-		}
-		same = reflect.DeepEqual(DesktopTitles(ids), desktopKnown(k.desktop))
-	}
+	same := k.ranges != nil && k.gen == cacheGeneration && k.today.Equal(today) &&
+		keptStill(k.files, files, k.prices, &k.titles, k.desktop, price, titles)
 	if !same {
 		forgetKeptStats()
 		k.files, k.today, k.gen = make([]keptFile, len(files)), today, cacheGeneration
 		for i, f := range files {
 			k.files[i] = keptFileOf(f)
 		}
-		k.ranges, k.prices, k.titles, k.desktop = map[int]Stats{}, map[string]*catalog.Price{}, map[string]string{}, map[string]string{}
+		k.ranges, k.prices, k.titles, k.desktop = map[int]Stats{}, map[string]*catalog.Price{}, titleAnswers{}, map[string]string{}
 	}
 	return same
+}
+
+// keptStill reports whether kept was taken of files as they are now, and
+// prices, titles and desktop, the answers what was made from them got, are
+// still what price, titles and Claude Desktop's names answer.
+func keptStill(kept []keptFile, files []file, prices map[string]*catalog.Price, names *titleAnswers, desktop map[string]string,
+	price func(string) *catalog.Price, titles func(string) string) bool {
+	if len(kept) != len(files) {
+		return false
+	}
+	for i := range files {
+		if kept[i] != keptFileOf(files[i]) {
+			return false
+		}
+	}
+	for model, p := range prices {
+		if !reflect.DeepEqual(price(model), p) {
+			return false
+		}
+	}
+	if !names.still(titles) {
+		return false
+	}
+	if len(desktop) > 0 {
+		ids := make([]string, 0, len(desktop))
+		for id := range desktop {
+			ids = append(ids, id)
+		}
+		return reflect.DeepEqual(DesktopTitles(ids), desktopKnown(desktop))
+	}
+	return true
 }
 
 // keptRanges is how many ranges are kept: the page asks for three, and a
@@ -127,7 +178,7 @@ func keptPrice(price func(string) *catalog.Price) func(string) *catalog.Price {
 func keptTitle(titles func(string) string) func(string) string {
 	return func(id string) string {
 		t := titles(id)
-		keptStats.titles[id] = t
+		keptStats.titles.note(id, t)
 		return t
 	}
 }
@@ -151,5 +202,15 @@ func keepDesktop(st Stats) {
 
 func forgetKeptStats() {
 	keptStats.files, keptStats.ranges, keptStats.native = nil, nil, nil
-	keptStats.prices, keptStats.titles, keptStats.desktop = nil, nil, nil
+	keptStats.prices, keptStats.titles, keptStats.desktop = nil, titleAnswers{}, nil
+}
+
+// ForgetKeptRanges lets go of the ranges' Stats kept for the next read,
+// and what they were checked against, once no page has asked for a while.
+// The parsed files stay: a page that asks again sums them up again
+// (~0.1 s for a long history) and reads no file.
+func ForgetKeptRanges() {
+	mu.Lock()
+	defer mu.Unlock()
+	forgetKeptStats()
 }

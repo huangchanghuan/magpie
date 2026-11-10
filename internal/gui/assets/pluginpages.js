@@ -7,19 +7,19 @@
 // from that frame only, and the window answers only what the page may:
 // the theme, its own options, and the reads its package declared
 // (magpie.permissions), which /api/plugin-pages/read checks again.
-// A page that throws, or never says hello, shows the kernel's "This
-// page stopped working" with its Try again.
 //
 // Panels (magpie.panels, P5) are framed the same way in a page's
-// .plugin-slot, as tall as they draw, and one that breaks says so in its
-// place. A page may take a built-in one's place (magpie.page.replaces),
-// and its actions (magpie.actions, P6) are row menu items that open it:
-// plugin-runtime.md says the rest.
+// .plugin-slot, as tall as they draw. plugin-runtime.md says the rest:
+// a page broken, in a built-in one's place, opened by an action, shared.
 (() => {
   if (mode !== "window") return;
   // how long a page has to say hello before it is taken as broken
   const HELLO_MS = 10e3;
-  const pages = new Map(); // key → { entry, frame, hello, timer }
+  // how long a page the reader left keeps its frame: one left longer is
+  // let go, and loads again the next time it is opened, unless its
+  // package keeps it (magpie.page.keepAlive)
+  const IDLE_MS = 10 * 60e3;
+  const pages = new Map(); // key → { entry, frame, hello, timer, shown, idle }
   const panels = new Map(); // frame → { entry, frame, context, hello, timer, body }
   let panelList = []; // /api/plugin-panels: every panel of a plugin on
   let ctx = null;
@@ -58,12 +58,22 @@
     return m[locale] || m[locale.split("-")[0]] || e.title;
   }
 
+  // a page is told when the reader leaves it and comes back
+  // (magpie.onVisibility): a frame in a hidden view isn't hidden to itself
+  function seen(p, visible) {
+    if (p.shown === visible) return;
+    p.shown = visible;
+    if (p.hello) post(p.frame?.contentWindow, { event: "visibility", data: { visible } });
+  }
+
   // the page's frame, made the first time the page is opened (and again
-  // after Try again): a plugin's page costs nothing until it is looked at
+  // after Try again, or once it was let go): a plugin's page costs
+  // nothing until it is looked at
   function open(key) {
     const p = pages.get(key);
     if (!p) return undefined;
-    if (p.frame?.isConnected) return p.ready;
+    clearTimeout(p.idle);
+    if (p.frame?.isConnected) { seen(p, true); return p.ready; }
     const main = $("#view-" + key);
     const f = document.createElement("iframe");
     f.className = "plugin-frame";
@@ -76,6 +86,7 @@
     f.src = p.entry.url;
     p.frame = f;
     p.hello = false;
+    p.shown = true;
     p.ready = new Promise((resolve, reject) => {
       p.said = resolve;
       clearTimeout(p.timer);
@@ -83,6 +94,24 @@
     });
     main.replaceChildren(f);
     return p.ready;
+  }
+
+  // the reader went to another page: this one is told, and its frame is
+  // let go after IDLE_MS there, with what it holds (its scripts, timers,
+  // connections); one that is back by then, or keeps itself, stays
+  function leave(key) {
+    const p = pages.get(key);
+    if (!p?.frame) return;
+    seen(p, false);
+    clearTimeout(p.idle);
+    if (p.entry.keepAlive) return;
+    p.idle = setTimeout(() => {
+      if (view === key || !p.frame) return;
+      clearTimeout(p.timer);
+      p.frame.remove();
+      p.frame = null;
+      p.hello = false;
+    }, IDLE_MS);
   }
 
   async function answer(p, m) {
@@ -95,7 +124,7 @@
         // a panel is told where it is: the provider whose editor it is in;
         // a page served to a browser, where its local service is through
         // this server (pageservice.go), relative to the page
-        return { ...theme(), context: p.context || {}, service: (!p.context && e.service) || "" };
+        return { ...theme(), context: p.context || {}, service: (!p.context && e.service) || "", visible: p.shown ?? true };
       case "theme":
         return theme();
       case "options.get":
@@ -112,6 +141,9 @@
         if (!e.reads.includes(name)) throw new Error(t("{name} doesn't ask to read {what}", { name: titled(e), what: name }));
         return api("plugin-pages/read", { spec: e.spec, read: name, params: m.params?.params || {} });
       }
+      case "image.copy":
+      case "image.save":
+        return import("./pageshare.js").then(() => pageShare(e.spec, m.method === "image.save", m.params));
     }
     throw new Error(t("No such call: {what}", { what: String(m.method) }));
   }
@@ -211,7 +243,7 @@
       if (!p) {
         p = { entry: e };
         pages.set(e.key, p);
-        ctx.slots.add("page", { key: e.key, title: titled(e), html: "", mount(main) { main.classList.add("plugin-page"); p.frame = null; }, open: () => open(e.key) });
+        ctx.slots.add("page", { key: e.key, title: titled(e), html: "", mount(main) { main.classList.add("plugin-page"); p.frame = null; }, open: () => open(e.key), leave: () => leave(e.key) });
       } else if (p.entry.url !== e.url || p.gone) {
         p.frame?.remove();
         p.frame = null;

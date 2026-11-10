@@ -1,8 +1,9 @@
 // usemagpie.ai. Releases live on GitHub (yetone/magpie-releases); this
 // worker turns the newest one into the update feed the app reads and into
-// download links that never go stale.
+// download links that never go stale, and serves their files from R2,
+// copied there from GitHub (files.js).
 //
-//   /api/latest            {version, notes, url, published, assets: {name: {url, size, sha256}}}
+//   /api/latest            {version, notes, url, published, assets: {name: {url, api, size, sha256}}}
 //   /api/latest?channel=stable
 //                          the same for Settings' Stable channel: a release a
 //                          week, an urgent one at once ("The Stable channel"
@@ -23,11 +24,23 @@
 //                          a picture a plugin, market or import link names,
 //                          fetched here so its host sees Cloudflare, not the
 //                          user (the app fetches every remote icon this way)
+//   /docs/contributors, /docs/zh/contributors, /docs/ja/contributors
+//                          the contributors page, its table put in from
+//                          public/contributors/<lang>.html (credits-cli.mjs
+//                          wall, at each deploy)
 //   /download              the Apple Silicon dmg
 //   /download/mac-arm64    the same;  /download/mac-intel  the Intel dmg
 //   /download/windows      the Windows app (x64);  /download/windows-arm64
 //   /download/linux        the Linux app (x86-64); /download/linux-arm64
 //   /download/<file>       any file of the newest release, by name
+//   /files/<tag>/<file>    a release's file from R2 (files.js), the feed's
+//                          url and /download's for the files R2 holds;
+//                          GitHub's own address for any it doesn't
+//   /dl/<tag>/<file>       a release's file through GitHub's API, the feed's
+//                          url while github.com's download address fails
+//   /r/...                 the pages' PostHog snippet, passed on to PostHog
+//                          (relay, below) so a blocker that knows its host
+//                          doesn't drop the count
 //   /docs, /docs/zh, /docs/ja  the getting-started guide: /docs/start, /docs/<lang>/start
 //   /zh/, /ja/, /de/       the home page in Chinese, Japanese, German (i18n.js);
 //                          / sends a browser that prefers one of them there,
@@ -39,8 +52,10 @@
 import { LANGS } from "./i18n.js";
 import { PARTNERS } from "./partners.js";
 import { SPONSORS } from "./sponsors.js";
+import { serve as serveFile, held, onR2, mirror, githubFile } from "./files.js";
 
 const REPO = "yetone/magpie-releases";
+const SITE = "https://usemagpie.ai";
 const TTL = 300; // seconds the newest release is remembered
 
 const SHORT = {
@@ -57,6 +72,9 @@ const SHORT = {
 
 // The bare docs paths open the getting-started guide.
 const DOCS = { "/docs": "/docs/start", "/docs/zh": "/docs/zh/start", "/docs/ja": "/docs/ja/start" };
+// pages that moved, from the old path (no .html) to the new one: the MCP
+// hub was renamed the MCP router
+const MOVED = { "/docs/mcp-hub": "/docs/mcp-router", "/docs/zh/mcp-hub": "/docs/zh/mcp-router", "/docs/ja/mcp-hub": "/docs/ja/mcp-router" };
 // the languages the docs are written in besides English
 const DOC_LANGS = ["zh", "ja"];
 
@@ -74,11 +92,11 @@ export default {
       if (url.searchParams.get("channel") === "stable") {
         const got = await stable(ctx, env, Date.now());
         if (!got) return json({ error: "the stable version isn't known yet" }, 503, NO_STORE);
-        return json({ ...got.rel, notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
+        return json({ ...(await fromR2(ctx, env, got.rel)), notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
       }
       const got = await latest(ctx, env);
       if (!got) return json({ error: "no release yet" }, 503, NO_STORE);
-      return json({ ...got.rel, notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
+      return json({ ...(await fromR2(ctx, env, got.rel)), notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
     }
     if (url.pathname === "/api/partners") {
       const now = Date.now();
@@ -117,15 +135,26 @@ export default {
       return json({ releases: pick }, 200, cacheFor(got));
     }
     if (url.pathname === "/api/icon") return icon(url.searchParams.get("url"));
+    const file = url.pathname.match(/^\/files\/(v[0-9][0-9A-Za-z.+-]*)\/([0-9A-Za-z._+-]+)$/);
+    if (file) return serveFile(req, env, REPO, file[1], file[2]);
+    const dl = url.pathname.match(/^\/dl\/(v[0-9][0-9A-Za-z.+-]*)\/([0-9A-Za-z._+-]+)$/);
+    if (dl) return detour(ctx, env, dl[1], dl[2]);
+    if (url.pathname.startsWith(RELAY)) return relay(req, url);
     if (url.pathname === "/download" || url.pathname.startsWith("/download/")) {
       const want = url.pathname.split("/")[2] || "mac-arm64";
       const got = await latest(ctx, env);
-      const asset = got && got.rel.assets && got.rel.assets[SHORT[want] || want];
+      const rel = got && (await fromR2(ctx, env, got.rel));
+      const asset = rel && rel.assets && rel.assets[SHORT[want] || want];
       if (!asset) return new Response("not found\n", { status: 404 });
+      if (req.method === "GET") ctx.waitUntil(capture("magpie site download", { link: want, file: SHORT[want] || want, client: client(req), country: country(req) }));
       return Response.redirect(asset.url, 302);
     }
+    // crawlers and old browsers ask for /favicon.ico whatever the page links
+    if (url.pathname === "/favicon.ico") return Response.redirect(new URL("/favicon.png", url).toString(), 301);
     const guide = DOCS[url.pathname.replace(/\/+$/, "")];
     if (guide) return Response.redirect(new URL(guide, url).toString(), 302);
+    const moved = MOVED[url.pathname.replace(/(\.html)?\/*$/, "")];
+    if (moved) return Response.redirect(new URL(moved + url.search, url).toString(), 301);
     // an English docs page, to a browser whose language has its own: as /
     // does, until a language is picked
     const doc = url.pathname.match(/^\/docs\/([a-z-]+)(\.html)?$/);
@@ -136,7 +165,7 @@ export default {
       // a page not written in that language yet stays English
       if (DOC_LANGS.includes(lang) && (await env.ASSETS.fetch(new Request(new URL(there, url), { method: "HEAD" }))).ok)
         return new Response(null, { status: 302, headers: { Location: there + url.search, ...vary } });
-      const res = beacon(await env.ASSETS.fetch(req));
+      const res = beacon(await withWall(await env.ASSETS.fetch(req), env, url));
       const out = new Response(res.body, res);
       out.headers.append("Vary", "Accept-Language, Cookie");
       out.headers.set("Cache-Control", "no-cache");
@@ -159,12 +188,16 @@ export default {
       out.headers.append("Vary", "Accept-Language, Cookie");
       return out;
     }
-    return beacon(await env.ASSETS.fetch(req));
+    if (url.pathname === "/install.sh" && req.method === "GET")
+      ctx.waitUntil(capture("magpie site install script", { client: client(req), country: country(req) }));
+    return beacon(await withWall(await env.ASSETS.fetch(req), env, url));
   },
-  // the cron (wrangler.jsonc's triggers) keeps the ledger the Stable
-  // channel is chosen from
+  // the crons (wrangler.jsonc's triggers): every quarter hour the ledger
+  // the Stable channel is chosen from, every five minutes the newest and
+  // the Stable release's files into R2
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(keepLedger(env, Date.now()));
+    if (event.cron === MIRROR_CRON) ctx.waitUntil(keepFiles(ctx, env));
+    else ctx.waitUntil(keepLedger(env, Date.now()));
   },
 };
 
@@ -234,6 +267,11 @@ function fromMagpie(to) {
   } catch {
     return to;
   }
+}
+
+// client says whether a browser asked, or a command (curl, wget, a script).
+function client(req) {
+  return /^Mozilla\//.test(req.headers.get("User-Agent") || "") ? "browser" : "command";
 }
 
 function country(req) {
@@ -309,9 +347,33 @@ function translate(res, lang) {
   return rw.transform(out);
 }
 
-// beacon adds Cloudflare Web Analytics and PostHog's Web Analytics to a page.
-// The dashboard's automatic injection skips whatever a worker returns, and
-// every page passes through this one. PostHog keeps its visitor id in
+// relay passes a request of the pages' PostHog snippet (under RELAY) on to
+// PostHog: the library and its config from the assets host, the rest from
+// the ingestion host. The visitor's address goes as X-Forwarded-For, which
+// PostHog reads for the country, and the site's cookies stay here.
+const RELAY = "/r/";
+export async function relay(req, url) {
+  const path = url.pathname.slice(RELAY.length - 1);
+  const host = /^\/(static|array)\//.test(path) ? "us-assets.i.posthog.com" : "us.i.posthog.com";
+  const headers = new Headers(req.headers);
+  for (const h of ["Cookie", "Host"]) headers.delete(h);
+  const ip = req.headers.get("CF-Connecting-IP");
+  if (ip) headers.set("X-Forwarded-For", ip);
+  const body = req.method === "GET" || req.method === "HEAD" ? null : req.body;
+  try {
+    return await fetch(`https://${host}${path}${url.search}`, { method: req.method, headers, body, redirect: "manual" });
+  } catch {
+    return new Response("", { status: 502 });
+  }
+}
+
+// beacon adds PostHog's Web Analytics to a page; every page passes through
+// this one. Cloudflare Web Analytics is not added here: Cloudflare injects
+// its own beacon into worker responses now, and that one reports to this
+// site's /cdn-cgi/rum. A second, manual beacon loaded first and won, and
+// reported to cloudflareinsights.com, which answers 404 for this site's
+// token, so Web Analytics counted no visits at all. PostHog's requests go through RELAY
+// on this site. PostHog keeps its visitor id in
 // localStorage, never a cookie: these pages vary on Cookie (the lang
 // cookie), and a per-visitor cookie would ride on every request. It isn't
 // cookieless, since cookieless drops the address before GeoIP and the
@@ -321,8 +383,24 @@ function translate(res, lang) {
 // and the rest of the project's settings come from its remote config, so
 // flags aren't turned off. Nothing is loaded under Do Not Track or Global
 // Privacy Control. Its project is the daily count's.
-const WEB_ANALYTICS = `<script>if(!(navigator.doNotTrack=="1"||window.doNotTrack=="1"||navigator.globalPrivacyControl)){!function(t,e){var o,n,p,r;e.__SV||(window.posthog&&window.posthog.__loaded)||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+" (stub)"},o="capture register unregister opt_out_capturing opt_in_capturing has_opted_out_capturing set_config".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);posthog.init("${POSTHOG_KEY}",{api_host:"https://us.i.posthog.com",persistence:"localStorage",person_profiles:"identified_only",capture_pageview:true,capture_pageleave:true,autocapture:true,enable_heatmaps:true,capture_dead_clicks:true,capture_exceptions:true,capture_performance:{web_vitals:true,network_timing:true},session_recording:{maskAllInputs:true},disable_surveys:true,respect_dnt:true})}</script>`;
-const BEACON = `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "c09e76abf16b40b2aa5571c196efb847"}'></script>` + WEB_ANALYTICS;
+const WEB_ANALYTICS = `<script>if(!(navigator.doNotTrack=="1"||window.doNotTrack=="1"||navigator.globalPrivacyControl)){!function(t,e){var o,n,p,r;e.__SV||(window.posthog&&window.posthog.__loaded)||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+" (stub)"},o="capture register unregister opt_out_capturing opt_in_capturing has_opted_out_capturing set_config".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);posthog.init("${POSTHOG_KEY}",{api_host:location.origin+"/r",ui_host:"https://us.posthog.com",persistence:"localStorage",person_profiles:"identified_only",capture_pageview:true,capture_pageleave:true,autocapture:true,enable_heatmaps:true,capture_dead_clicks:true,capture_exceptions:true,capture_performance:{web_vitals:true,network_timing:true},session_recording:{maskAllInputs:true},disable_surveys:true,respect_dnt:true})}</script>`;
+const BEACON = WEB_ANALYTICS;
+
+// The contributors page: its #wall gets the table credits-cli.mjs rendered
+// for that language at deploy. Without it (a deploy that couldn't build
+// it) the page keeps the line it is written with.
+const WALL_PAGE = /^\/docs\/(?:(zh|ja)\/)?contributors(?:\.html)?$/;
+export async function withWall(res, env, url) {
+  const m = url.pathname.match(WALL_PAGE);
+  if (!m || !res.ok || !(res.headers.get("Content-Type") || "").startsWith("text/html")) return res;
+  let table = "";
+  try {
+    const got = await env.ASSETS.fetch(new Request(new URL(`/contributors/${m[1] || "en"}.html`, url)));
+    if (got.ok) table = await got.text();
+  } catch {}
+  if (!table.includes("<table")) return res;
+  return new HTMLRewriter().on("#wall", { element: (el) => el.setInnerContent(table, { html: true }) }).transform(res);
+}
 
 function beacon(res) {
   if (!(res.headers.get("Content-Type") || "").startsWith("text/html")) return res;
@@ -374,8 +452,10 @@ async function latest(ctx, env) {
   if (hit && hit.rel && hit.rel.version) return hit;
   const full = await fromAPI(env);
   if (full) {
-    const got = { rel: full, degraded: false };
-    remember(ctx, "latest", got, TTL);
+    // a feed sending the files by /dl is kept briefly: github.com's own
+    // address is given again as soon as it answers
+    const got = { rel: full, degraded: detoured(full) };
+    remember(ctx, "latest", got, got.degraded ? BRIEF : TTL);
     remember(ctx, "latest-good", full, KEEP);
     return got;
   }
@@ -392,6 +472,46 @@ async function latest(ctx, env) {
 }
 
 const UA = { "User-Agent": "usemagpie.ai" };
+
+const MIRROR_CRON = "*/5 * * * *";
+
+// fromR2 is rel with the files R2 holds at /files (onR2); what R2 holds
+// of a tag is asked once a minute.
+async function fromR2(ctx, env, rel) {
+  if (!rel || !env.RELEASES) return rel;
+  const tag = "v" + rel.version;
+  let have = await cached("r2/" + tag);
+  if (!have || typeof have !== "object") {
+    have = await held(env, tag);
+    if (have) remember(ctx, "r2/" + tag, have, BRIEF);
+  }
+  return onR2(rel, have, REPO, SITE);
+}
+
+// keepFiles is the five-minute cron's run: the newest release's files and
+// the Stable one's into R2, each from github.com's address or, when that
+// fails, by way of GitHub's API (located).
+async function keepFiles(ctx, env) {
+  if (!env.RELEASES) return;
+  const rels = [];
+  const got = await latest(ctx, env);
+  if (got) rels.push(got.rel);
+  const st = await stable(ctx, env, Date.now()).catch((e) => console.log("r2: stable", String(e)));
+  if (st) rels.push(st.rel);
+  const open = async (name, a, tag) => {
+    let res = null;
+    try {
+      res = await fetch(githubFile(REPO, tag, name), { headers: UA });
+    } catch (e) {
+      console.log("r2: github.com", name, String(e));
+    }
+    if (res && res.ok) return res;
+    const to = a.api && (await located(a.api, env));
+    return to ? fetch(to, { headers: UA }) : res;
+  };
+  const done = await mirror(env, rels, open);
+  if (done.copied.length || done.failed.length) console.log("r2", JSON.stringify(done));
+}
 
 // api asks GitHub's API, with the GITHUB_TOKEN secret where one is set.
 function api(path, env) {
@@ -416,14 +536,82 @@ async function fromAPI(env, path = "releases/latest") {
   }
   const gh = await res.json();
   const tag = gh.tag_name;
-  const sums = await checksums(tag);
-  if (!sums) return null;
+  const listed = gh.assets.find((a) => a.name === "SHA256SUMS");
+  const got = await checksums(tag, env, listed && listed.url);
+  if (!got) return null;
   const rel = { version: tag.replace(/^v/, ""), notes: gh.body || "", url: gh.html_url, published: gh.published_at, assets: {} };
   for (const a of gh.assets) {
     if (a.name === "SHA256SUMS") continue;
-    rel.assets[a.name] = { url: a.browser_download_url, size: a.size, sha256: sums[a.name] || "" };
+    // api: the file's address in GitHub's API, which an app asks when
+    // url is busy. With github.com's download address failing (504 for
+    // hours on 2026-11-08), url is the site's /dl, which redirects
+    // through the API: an app too old to know api follows it, and still
+    // checks the file against sha256.
+    const url = got.direct ? a.browser_download_url : `${SITE}/dl/${tag}/${encodeURIComponent(a.name)}`;
+    rel.assets[a.name] = { url, api: a.url, size: a.size, sha256: got.sums[a.name] || "" };
   }
   return rel;
+}
+
+// detoured: whether rel's files go by the site's /dl
+function detoured(rel) {
+  return Object.values(rel.assets || {}).some((a) => a.url && a.url.startsWith(SITE + "/dl/"));
+}
+
+// located is where GitHub's API sends an ask for a release file's bytes
+// (Accept: application/octet-stream): a signed address on GitHub's asset
+// host, good for some minutes, or null. The redirect is read, not
+// followed, so no Authorization goes to the asset host.
+async function located(apiURL, env) {
+  const headers = { ...UA, Accept: "application/octet-stream" };
+  if (env && env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
+  let res;
+  try {
+    res = await fetch(apiURL, { headers, redirect: "manual" });
+  } catch (e) {
+    console.log("github asset", e);
+    return null;
+  }
+  const to = res.headers.get("Location") || "";
+  let host = "";
+  try {
+    host = new URL(to).hostname;
+  } catch {}
+  if (res.status < 300 || res.status > 399 || !to.startsWith("https://") || !(host.endsWith(".githubusercontent.com") || host === "github.com")) {
+    console.log("github asset", res.status, to.slice(0, 80));
+    return null;
+  }
+  return to;
+}
+
+// detour is /dl/<tag>/<file>: a redirect to the release's file by way of
+// GitHub's API (located), for when github.com's download address fails.
+// Where GitHub's API sends is kept five minutes, and each release's list
+// of files an hour, so a worker IP's 60 anonymous asks an hour go far.
+// The file is checked by whoever downloads it, against the feed's hash.
+async function detour(ctx, env, tag, name) {
+  const key = `dl/${tag}/${name}`;
+  let to = await cached(key);
+  if (typeof to !== "string" || !to) {
+    let files = await cached(`dl-files/${tag}`);
+    if (!files || typeof files !== "object") {
+      let res = null;
+      try {
+        res = await api(`releases/tags/${tag}`, env);
+      } catch (e) {
+        console.log("github api", tag, e);
+      }
+      if (!res || !res.ok) return new Response("GitHub didn't say where the file is; try again in a minute\n", { status: 502, headers: NO_STORE });
+      files = {};
+      for (const a of (await res.json()).assets || []) files[a.name] = a.url;
+      remember(ctx, `dl-files/${tag}`, files, 3600);
+    }
+    if (!files[name]) return new Response("not found\n", { status: 404 });
+    to = await located(files[name], env);
+    if (!to) return new Response("GitHub didn't hand out the file; try again in a minute\n", { status: 502, headers: NO_STORE });
+    remember(ctx, key, to, 300);
+  }
+  return new Response(null, { status: 302, headers: { Location: to, ...NO_STORE } });
 }
 
 async function fromPages() {
@@ -447,8 +635,9 @@ async function fromPages() {
 // date from entry ({notes, published}) where there is one: every file, its
 // size unknown (0). null when SHA256SUMS can't be read.
 async function fromSums(tag, entry) {
-  const sums = await checksums(tag);
-  if (!sums) return null;
+  const got = await checksums(tag);
+  if (!got) return null;
+  const sums = got.sums;
   const url = `https://github.com/${REPO}/releases/tag/${tag}`;
   const rel = { version: tag.replace(/^v/, ""), notes: entry ? entry.notes : "", url, published: entry ? entry.published : null, assets: {} };
   for (const [name, sha256] of Object.entries(sums)) {
@@ -520,7 +709,8 @@ async function releases(ctx, env) {
 // first) and "notes:<UTC day>" each day's notes by version, which
 // /api/notes reads for a range older than the hundred newest. Without the
 // ledger, or one that doesn't reach back to the week's cut, Stable isn't
-// known and the feed says so (503) rather than guess.
+// known and the feed says so (503) rather than guess. The Docker image's
+// stable tag follows this feed (.github/workflows/docker-stable.yml).
 const DAY = 86400e3;
 const SOAK = 3 * DAY;
 const LEDGER_DAYS = 45;
@@ -586,7 +776,8 @@ async function stable(ctx, env, now) {
   const pick = stableOf(ix.list.map((r) => ({ version: r.v, published: r.p, urgent: !!r.u })), now);
   if (!pick) return null;
   const tag = "v" + pick.version;
-  let rel = await fromAPI(env, "releases/tags/" + tag), degraded = false;
+  let rel = await fromAPI(env, "releases/tags/" + tag);
+  let degraded = !!rel && detoured(rel);
   if (!rel) {
     // the API said no: the files from SHA256SUMS, the notes from the ledger
     const [entry] = await fromLedger(env, null, null, pick.version, 1);
@@ -844,22 +1035,35 @@ function newer(a, b) {
   return x.pre > y.pre;
 }
 
-// checksums reads a release's SHA256SUMS: {file name: hash}.
-async function checksums(tag) {
-  let r;
+// checksums reads a release's SHA256SUMS: {sums: {file name: hash},
+// direct}, or null. direct says github.com's download address gave it;
+// when that fails, viaAPI (the file's address in GitHub's API) is asked.
+async function checksums(tag, env, viaAPI) {
+  let r = null;
   try {
     r = await fetch(`https://github.com/${REPO}/releases/download/${tag}/SHA256SUMS`, { headers: UA });
   } catch (e) {
     console.log("SHA256SUMS", e);
-    return null;
   }
-  if (!r.ok) return null;
+  let direct = !!r && r.ok;
+  if (!direct) {
+    if (r) console.log("SHA256SUMS", r.status);
+    const to = viaAPI && (await located(viaAPI, env));
+    if (!to) return null;
+    try {
+      r = await fetch(to, { headers: UA });
+    } catch (e) {
+      console.log("SHA256SUMS through the API", e);
+      return null;
+    }
+    if (!r.ok) return null;
+  }
   const sums = {};
   for (const line of (await r.text()).split("\n")) {
     const [hash, name] = line.trim().split(/\s+\*?/);
     if (hash && name) sums[name] = hash;
   }
-  return sums;
+  return { sums, direct };
 }
 
 // ---- icons ------------------------------------------------------------------

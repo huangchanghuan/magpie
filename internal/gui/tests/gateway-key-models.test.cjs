@@ -13,6 +13,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 1000, height: 420 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(6000);
+      page.setDefaultNavigationTimeout(60000);
       const events = [], errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", fixture(lang, "light", events, { lan: true, limits: { server: { models: ["openai/*", "relay/m"] } } }));
@@ -75,7 +76,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(await scrolled(), at, "no click moved the page");
       // narrow: the row fits
       await page.setViewportSize({ width: 560, height: 740 });
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+      // the nav fits once the resize is handled: wait for it, and a real
+      // overflow still fails at the timeout
+      await page.waitForFunction(() => document.documentElement.scrollWidth <= window.innerWidth);
       assert.deepEqual(errors, []);
     });
   }

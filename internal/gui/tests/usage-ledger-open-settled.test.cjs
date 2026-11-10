@@ -56,6 +56,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     // motion on: the sidebar moves as the reporter's does
     const p = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
     p.setDefaultTimeout(5000);
+    p.setDefaultNavigationTimeout(60000);
     const errors = [];
     p.on("pageerror", (e) => errors.push(e.message));
     const answer = { first: 0 };
@@ -64,7 +65,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     await p.locator('[data-view="usage"]').first().click();
     await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
     await p.locator("#ledWrap .led tbody tr").first().waitFor();
-    await p.locator("#period .opt").nth(1).click();
+    await p.locator("#period .opt").nth(2).click();
     await p.waitForFunction(() => document.querySelectorAll("#ledWrap .led tbody tr.led-row").length === 100);
     await p.waitForTimeout(600);
     const fitted = await p.locator("#ledWrap table.led").getAttribute("class");

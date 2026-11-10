@@ -14,13 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/source"
 	"github.com/yetone/magpie/internal/steady"
@@ -302,7 +302,10 @@ func latestRTK() (string, error) {
 	var r struct {
 		Tag string `json:"tag_name"`
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("couldn't read GitHub's answer: %w", err)
+	}
 	if err := json.Unmarshal(body, &r); err != nil {
 		return "", err
 	}
@@ -1027,10 +1030,10 @@ func brewError(out string) string {
 }
 
 var (
-	ansiSeq = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	ansiSeq = lazyre.New(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 	// a line that is only a spinner frame or a progress bar (winget's
 	// ██████▒▒▒ 1.20 MB / 3.40 MB, Homebrew's ###, curl's %)
-	progressLine = regexp.MustCompile(`^(?:[-\\|/]|[█▓▒░#=>.\s]*\d*(?:\.\d+)?\s*(?:[KMG]i?B\s*/\s*\d+(?:\.\d+)?\s*[KMG]i?B|%)?)$`)
+	progressLine = lazyre.New(`^(?:[-\\|/]|[█▓▒░#=>.\s]*\d*(?:\.\d+)?\s*(?:[KMG]i?B\s*/\s*\d+(?:\.\d+)?\s*[KMG]i?B|%)?)$`)
 )
 
 // installerSaid is the last lines an installer printed that say something:

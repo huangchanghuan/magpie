@@ -1,13 +1,13 @@
 package gui
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -15,6 +15,8 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/ghtoken"
+	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/middleware"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
@@ -49,7 +51,7 @@ type pluginOptionJSON struct {
 }
 
 // pluginOptionKey is the key an option may have, as the host checks it.
-var pluginOptionKey = regexp.MustCompile(`^[a-z0-9_-]{1,40}$`)
+var pluginOptionKey = lazyre.New(`^[a-z0-9_-]{1,40}$`)
 
 // pluginIcon is the vendor's icon: the one the plugin gives its provider,
 // else the one the plugin market gives the plugin or its provider, else
@@ -105,6 +107,9 @@ type pluginEntryJSON struct {
 	// Package is the package installed from a git repository, which its
 	// own package.json names
 	Package string `json:"package,omitempty"`
+	// OwnName is the name its package.json gives itself (magpie.name),
+	// which its row shows when the community's list doesn't name it
+	OwnName string `json:"ownName,omitempty"`
 	// Commit is the commit of its repository a git one was installed at,
 	// and Head the commit the repository was at when last asked (asking
 	// it again is /api/plugins/git's): an update is out only when they
@@ -167,6 +172,9 @@ type pluginEntryJSON struct {
 	// offers every agent under MCP's name: with their descriptions while
 	// the host runs, by name alone from what it noted last when it doesn't
 	Tools []pluginToolJSON `json:"tools,omitempty"`
+	// ToolsServer is the Library's server of those tools, whose agents
+	// the row turns them off and on for (chengming0v0 on Discord)
+	ToolsServer *library.PluginServer `json:"toolsServer,omitempty"`
 }
 
 // pluginToolJSON is one tool a plugin gives, as its row lists it.
@@ -219,10 +227,22 @@ type pluginsJSON struct {
 	// Mirror is the 「国内镜像」 switch: the list, npm and Bun asked of
 	// mirrors in China first (settings.ChinaMirror)
 	Mirror bool `json:"mirror"`
+	// Registry is the npm registry plugins are installed from and npm's
+	// answers asked of, and where it came from (plugin.Registry)
+	Registry plugin.RegistryInUse `json:"registry"`
+}
+
+// registryJSON is plugin.Registry with its file's path as the page shows it.
+func registryJSON() plugin.RegistryInUse {
+	r := plugin.Registry()
+	if r.Path != "" {
+		r.Path = tilde(r.Path)
+	}
+	return r
 }
 
 func pluginsState(ctx context.Context, w Windows) pluginsJSON {
-	s := pluginsJSON{Plugins: []pluginEntryJSON{}, Bun: plugin.HasBun(), BunVer: plugin.BunInUse(), Movable: provider.MoveCandidates(), Picker: w != nil && !isWeb(w), Mirror: settings.Load().ChinaMirror}
+	s := pluginsJSON{Plugins: []pluginEntryJSON{}, Bun: plugin.HasBun(), BunVer: plugin.BunInUse(), Movable: provider.MoveCandidates(), Picker: w != nil && !isWeb(w), Mirror: settings.Load().ChinaMirror, Registry: registryJSON()}
 	l := plugin.Load()
 	errs := map[string]string{}
 	names := map[string][]string{}
@@ -256,6 +276,10 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		}
 	}
 	toolNames := gateway.ToolNames(tools)
+	var servers map[string]library.PluginServer
+	if len(tools) > 0 {
+		servers = library.PluginServers()
+	}
 	// each plugin's subscriptions, by the names it gave last (plugin.Cached,
 	// which holds them without starting the host or asking anyone, and asks
 	// the plugins again in the background when a sign-in or the plugins
@@ -285,7 +309,7 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		}
 	}
 	for _, e := range l.Plugins {
-		j := pluginEntryJSON{Entry: e, Error: errs[e.Spec], Providers: names[e.Spec], Version: plugin.Installed(e.Spec), Named: answered}
+		j := pluginEntryJSON{Entry: e, Error: errs[e.Spec], Providers: names[e.Spec], Version: plugin.Installed(e.Spec), Named: answered, OwnName: plugin.InstalledName(e.Spec)}
 		if plugin.Gateway(plugin.Target(e.Spec)) != "" {
 			j.IsGateway = true
 			j.GatewayOnly = plugin.GatewayOnly(plugin.Target(e.Spec))
@@ -316,9 +340,11 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		if file, only := plugin.Middleware(plugin.Target(e.Spec)); file != "" {
 			j.IsMiddleware, j.MiddlewareOnly = true, only
 		}
-		if j.IsMiddleware || j.IsGateway {
-			j.OptionsExample = plugin.OptionsExample(plugin.Target(e.Spec))
-		}
+		// every plugin's, a provider plugin's too (Devin's keepalive,
+		// plugins#592): its row offers the same options editor. Not only
+		// one whose providers are known, as those are named in the
+		// background and the button would come and go with them
+		j.OptionsExample = plugin.OptionsExample(plugin.Target(e.Spec))
 		if file, _ := plugin.Agent(plugin.Target(e.Spec)); file != "" {
 			j.IsAgent = true
 			j.InMagpieOnly = plugin.InMagpieOnly(plugin.Target(e.Spec))
@@ -358,6 +384,9 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 			}
 			for _, x := range pt.Tools {
 				j.Tools = append(j.Tools, pluginToolJSON{Name: x.Name, Description: x.Description, MCP: toolNames[e.Spec][x.Name]})
+			}
+			if sv, ok := servers[plugin.Name(e.Spec)]; ok && len(j.Tools) > 0 {
+				j.ToolsServer = &sv
 			}
 		}
 		j.Moved = provider.MovedOnto(e.Spec)
@@ -436,12 +465,8 @@ func pluginListings(ctx context.Context) []pluginListingJSON {
 		}
 		out = append(out, j)
 	}
-	ns := make([]*plugin.NPM, len(out))
-	for i := range out {
-		ns[i] = out[i].NPM
-	}
 	// at once: a picture still being fetched shows on the next ask
-	npmIcons(ns, 0)
+	listingIcons(out, 0)
 	return out
 }
 
@@ -453,12 +478,42 @@ func pluginAgents(ctx context.Context) []string {
 		have[plugin.Name(e.Spec)] = true
 	}
 	out := []string{}
-	for _, l := range plugin.Market(ctx) {
+	// the community's alone, as Discover's Agents: an author's own is
+	// found by a search
+	for _, l := range plugin.Community(plugin.Market(ctx)) {
 		if l.Kind == "agent" && !have[l.Package] {
 			out = append(out, l.Name)
 		}
 	}
 	return out
+}
+
+// listingIcons puts each listing's pictures as the page can show them:
+// the one registry.json gives (Kilo Code's https://github.com/Kilo-Org.png)
+// and the one its package.json gives, both kept as a GitHub-tagged
+// plugin's is, in one wait. A bundled icon's name is left as it is; a
+// picture not kept by wait is left out, so the card shows npm's picture
+// or its kind's glyph until the next ask.
+func listingIcons(ls []pluginListingJSON, wait time.Duration) {
+	n := len(ls)
+	said := make([]string, 2*n)
+	for i, l := range ls {
+		if provider.MarketPicture(l.Icon) {
+			said[i] = l.Icon
+		}
+		if l.NPM != nil {
+			said[n+i] = l.NPM.Icon
+		}
+	}
+	got := provider.RepoIcons(said, wait)
+	for i := range ls {
+		if said[i] != "" {
+			ls[i].Icon = got[i]
+		}
+		if ls[i].NPM != nil {
+			ls[i].NPM.Icon = got[n+i]
+		}
+	}
 }
 
 // npmIcons puts the picture each package gives (magpie.icon) as the page
@@ -509,14 +564,15 @@ func pluginMarketState(ctx context.Context, w Windows) pluginMarketJSON {
 	info := plugin.Info(ctx, names)
 	m := pluginMarketJSON{Listings: []pluginListingJSON{}, State: st}
 	for _, l := range ls {
-		n := info[l.Package]
-		m.Listings = append(m.Listings, pluginListingJSON{Listing: l, NPM: &n})
+		j := pluginListingJSON{Listing: l}
+		// npm not answered for (or the dist branch unread) is unknown:
+		// no npm, not an empty one that reads as Coming soon
+		if n, ok := info[l.Package]; ok {
+			j.NPM = &n
+		}
+		m.Listings = append(m.Listings, j)
 	}
-	ns := make([]*plugin.NPM, len(m.Listings))
-	for i := range m.Listings {
-		ns[i] = m.Listings[i].NPM
-	}
-	npmIcons(ns, 3*time.Second)
+	listingIcons(m.Listings, 3*time.Second)
 	for i, e := range m.State.Plugins {
 		if !plugin.IsGit(e.Spec) {
 			m.State.Plugins[i].Latest = info[plugin.Name(e.Spec)].Version
@@ -671,6 +727,20 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, map[string]bool{"mirror": in.On})
 	})
+	// the npm registry set in magpie, "" for none of its own: an address
+	// that isn't an http(s) one is refused, not kept
+	mux.HandleFunc("POST /api/plugins/registry", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ URL string }
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if _, err := plugin.SetRegistry(in.URL); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, map[string]any{"registry": registryJSON()})
+	})
 	// add, remove, update, turn on or off: each answers with the list
 	mux.HandleFunc("POST /api/plugins/{op}", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
@@ -798,11 +868,7 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
-		var failed string
-		if w != nil && !st.Opened {
-			failed = openError(w, st.URL)
-		}
-		writeJSON(rw, signInOpened{st, failed})
+		writeJSON(rw, openSignIn(w, st))
 	})
 }
 
@@ -844,6 +910,13 @@ type pluginAgentJSON struct {
 	Name  string `json:"name,omitempty"`
 	Icon  string `json:"icon,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Missing is an agent magpie doesn't find on this computer, so Agents
+	// has no row for it (zzZ: Kimi's plugin installed and no Kimi there);
+	// Looks is where it looks, and Notice the plugin's own word on what
+	// the agent needs first
+	Missing bool   `json:"missing,omitempty"`
+	Looks   string `json:"looks,omitempty"`
+	Notice  string `json:"notice,omitempty"`
 }
 
 func pluginAgentOf(spec string, errs map[string]string) *pluginAgentJSON {
@@ -851,9 +924,18 @@ func pluginAgentOf(spec string, errs map[string]string) *pluginAgentJSON {
 		return &pluginAgentJSON{Error: err}
 	}
 	for _, a := range agent.All() {
-		if a.Plugin == spec {
-			return &pluginAgentJSON{ID: a.ID, Name: a.Name, Icon: a.Icon}
+		if a.Plugin != spec {
+			continue
 		}
+		j := &pluginAgentJSON{ID: a.ID, Name: a.Name, Icon: a.Icon}
+		if !a.Detected() {
+			j.Missing = true
+			j.Looks = tilde(cmp.Or(a.Dir, a.Path))
+			if a.Notice != nil {
+				j.Notice = a.Notice()
+			}
+		}
+		return j
 	}
 	return nil
 }

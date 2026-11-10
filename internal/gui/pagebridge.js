@@ -10,6 +10,12 @@
 //   await magpie.options.set(o)   sets them, and answers with them
 //   await magpie.read(name, p)    a read its package.json's
 //                                 magpie.permissions declares
+//   await magpie.image.copy(png)  puts a PNG (a Blob, as a canvas's
+//                                 toBlob makes it) on the clipboard
+//   await magpie.image.save(png, name)
+//                                 saves it in Downloads as name.png, and
+//                                 answers { path } ("" in magpie web,
+//                                 where the browser downloads it)
 //   magpie.context                where a panel is (P5): { provider: {
 //                                 id, name } } in a provider's editor,
 //                                 else {}; set once magpie.ready is
@@ -24,6 +30,14 @@
 //                                 when one of its magpie.actions is picked
 //                                 in a row's menu (P6); one picked before
 //                                 fn was given waits for it
+//   magpie.visible               false while the reader is on another of
+//                                 the window's pages
+//   magpie.onVisibility(fn)      fn(visible) as the reader leaves the
+//                                 page and comes back, to pause what only
+//                                 matters while it is seen; a page left
+//                                 10 minutes is let go, and loads again
+//                                 when next opened, unless package.json
+//                                 says magpie.page.keepAlive
 //
 // A panel (magpie.panels) is as tall as what it draws: the window is told
 // its height as it changes.
@@ -41,6 +55,7 @@
   const waiting = new Map();
   let next = 0;
   const themed = [];
+  const watched = [];
   let acting = null;
   const acted = [];
   function call(method, params) {
@@ -66,6 +81,11 @@
       api.theme = m.data;
       paint(m.data);
       for (const fn of themed) { try { fn(m.data); } catch (err) { report(err); } }
+      return;
+    }
+    if (m.event === "visibility") {
+      api.visible = !!m.data?.visible;
+      for (const fn of watched) { try { fn(api.visible); } catch (err) { report(err); } }
       return;
     }
     if (m.event === "action") {
@@ -102,7 +122,9 @@
     theme: null,
     context: {},
     service: "",
+    visible: true,
     onTheme(fn) { themed.push(fn); },
+    onVisibility(fn) { watched.push(fn); },
     onAction(fn) {
       acting = fn;
       for (const d of acted.splice(0)) act(d);
@@ -112,9 +134,14 @@
       set: (options) => call("options.set", { options }),
     },
     read: (name, params) => call("read", { name, params }),
+    image: {
+      copy: (png) => call("image.copy", { png }),
+      save: (png, name) => call("image.save", { png, name }),
+    },
   };
-  api.ready = call("hello").then(({ context, service, ...theme }) => {
+  api.ready = call("hello").then(({ context, service, visible, ...theme }) => {
     api.theme = theme;
+    if (visible === false) api.visible = false;
     api.context = context || {};
     api.service = "";
     try { if (service) api.service = new URL(service, location.href).href; } catch { /* none */ }

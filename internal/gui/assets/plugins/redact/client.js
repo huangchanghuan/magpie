@@ -7,9 +7,11 @@
 // list under it each request (or each value) masking changed (between
 // them, folded, demo.js's 小鹊 shows how masking works), and a
 // request opened says what it carried, what the vendor got instead, and
-// how each value was found and put back. The hooks are what the shell
-// asks of it: open, refresh (the window came back), reload (Refresh in
-// the sidebar), leave, and focus (a masked call's badge opens its request).
+// how each value was found and put back. The Masking alert is with
+// masking's other settings, in Settings › Privacy (settings.js). The
+// hooks are what the shell asks of it: open, refresh (the window came
+// back), reload (Refresh in the sidebar), leave, and focus (a masked
+// call's badge opens its request).
 magpie.plugin("redact", (ctx) => {
   ctx.slots.add("page", {
     key: "masking",

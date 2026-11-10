@@ -8,7 +8,9 @@ with. The response returns that id in `X-Magpie-Session`; listed browser
 origins can read this header through CORS. magpie never makes up an id for a
 request without one, so such a request has no session and its text is not
 recorded: text kept under an id nothing lists couldn't be opened. Prompt text,
-caller keys and network addresses are never used to guess conversation ownership.
+caller keys and network addresses are never used to guess conversation ownership,
+with one exception, Qoder's below, where the prompt is matched against the
+session files the agent itself wrote.
 So the configs magpie writes have each agent name its session: Pi's provider
 block sets `compat.sendSessionAffinityHeaders` (`x-session-affinity` on Chat and
 Messages; Responses sends `session_id` anyway), and omp 16.0.6 and later gets
@@ -30,6 +32,29 @@ identify the current session. This lets Routing group requests by the same id
 the native WorkBuddy session reader already knows; old requests without a
 recorded session remain unnamed. See `TestWorkBuddySessionHeader`,
 `TestWorkBuddySessionThroughGateway` and `TestRemoteMagpieKeepsTheSession`.
+
+Qoder's CLI (qodercli, qoderclicn) named its session in `session-id` up to
+1.1.81; 1.1.82 sends no session at all (coderlee233 on Discord). For a request
+from Qoder or Qoder CN (by its agent token) on this computer that names no
+session, `qoderSession` ([`qoder_session.go`](../../internal/gateway/qoder_session.go))
+finds the session in Qoder's own folder (`sessions.QoderDir`): of the session
+files written in the last 24 hours (`projects/<project>/<id>.jsonl` and a
+recent one's `<id>/subagents/agent-*.jsonl`, whose lines name the parent
+session), the one whose typed prompts (`user` lines with `humanInput`, or
+`origin.kind` human) appear most in the request's user text, Qoder's
+`<system-reminder>` blocks left out; of equal ones, the file written last. A
+turn holds every prompt of its session, a subagent's turn the Agent tool's
+prompt, a title call the latest prompt or a transcript, a suggestion call
+"User: …". The id goes on the request as `session-id`, and in the caller
+passed to a remote magpie, so it is recorded, titled and grouped as 1.1.81's
+was. Files are read incrementally (whole lines only) and listed at most once
+a second, again at once when nothing matches; a side call (no tools) nothing
+matches is held up to 600 ms, since Qoder asks the first title as the prompt
+is sent, before it writes the file. A request that names a session is left as
+it came. Verification: `TestQoderRequestsFindTheirSession`,
+`TestQoderSamePromptTwoSessions`, `TestQoderFirstTitleBeforeItsFile`,
+`TestQoderSessionThroughGateway`, on qodercli 1.1.82's own requests and files
+(`testdata/qoder-1.1.82`).
 
 DSH names its session in `x-deepseek-harness-session-id`, read the same way
 after the others, and marks a request that compacts its context with
@@ -56,7 +81,40 @@ listed, read and deleted as Pi's (one file to the trash, nothing beside
 it; Raft starts afresh without it), with no resume command, no carry and
 no trace export (the gateway's Pi identity has those calls). Verification:
 `TestRaftSessions`, `TestRaftIsPiToTheGateway`, `TestRaftDeleteRestore`,
-`TestRaftSlockHome`. On `/api/sessions/manage`, in its
+`TestRaftSlockHome`. An omp session stands for its subagents and advisor
+too (`Session.Subs`, `subIDs` in
+[`sessions.go`](../../internal/sessions/sessions.go)): each one's file in
+the session's artifacts folder (`Kid.jsonl`, `__advisor.jsonl`) has a
+header id of its own, and omp sends that id, not the main session's, in
+`x-session-affinity`. The file's calls are counted in the main session, so
+the gateway's `omp|<sub id>` is its own in the same places as Raft's `pi|`
+key, and is never a second session counted again (Jumy, Discord 10-30:
+`TestOmpSubagentsAreTheSessionsToTheGateway`,
+`TestOmpSubagentCountedOnceWithTheGateway`). A Claude Code session's
+copies (`Copies`) are among its keys the same way. A ZCode session stands
+for its bare id too: a request names it by the id its database gives with
+a prefix stripped (`sess_…`, a subagent's `sess_subagent_agent_…`:
+`zcodeBareID`), its own as well as its forks' and subagents' (their files
+are in its group, `Subs`, and `idInFile` reads their ids). Without it a
+ZCode session whose files are here was a row under its folder and again a
+row under Seen through the gateway, and its spend counted twice
+(flandern1211_58540 on Discord, #5754;
+`TestZCodeGatewayRowIsTheSessionItself`). `requestIDs` is the one place
+that says which ids a request names a session by: `GatewayKeys` (the
+list, its spend, the stats' native set, `viaOf`, the management
+page's search) and `NativeIDs` (its count and delete) both read it. A Claude Code
+session Claude Desktop's Code tab ran is in Claude Code's folder, and only its lines' `entrypoint`
+(`claude-desktop`, `claude-desktop-3p`) tells it apart: its parse keeps the
+entrypoint of the line its folder came from (`state.Entry`), and the
+session is listed under `claude` with `App` `claude-desktop`. It is the
+gateway's `claude-desktop|<id>` too, as the gateway knows the Code tab by
+Desktop's user agent, in `MergeExternal`, the stats' native keys, the GUI's
+list and Via. Usage counts it under Desktop, as its calls are: the stats'
+rows and its summary carry `claude-desktop`, its key stays `claude:<id>`,
+and Usage › Sessions files it under its `app` (`TestStatsDesktopCodeTab`,
+`usage-sessions-desktop-app.test.cjs`). `NativeIDs` for `claude-desktop`
+doesn't read Claude Code's files yet (#4333). On `/api/sessions/manage`,
+in its
 counts as in its list, and on `/api/sessions/delete`, a native session is any
 session file the agent keeps, one nothing was said in too, with no limit
 (`sessions.NativeIDs`); one pass over the agents' files (`sessions.Manage`)
@@ -74,6 +132,17 @@ glance is never saved in the index (`savable`) nor taken by a refresh as a
 parse (`parsed`). See
 [`internal/sessions/manage_quick.go`](../../internal/sessions/manage_quick.go),
 `TestManageAnswersBeforeFirstReads` and `sessions-pending-fill.test.cjs`.
+A Claude Code session's folder is its first line's `cwd`, unless
+Claude Code's `/cd` moved it: the file goes to the new folder's project
+directory with a `{"type":"relocated","relocatedCwd":…}` line, while the
+lines before it keep the old `cwd`, and the last such line names the folder
+(`ccRelocated`; a glance reads it in the file's last 64 KB too). A parse
+saved by a magpie that didn't read those lines (`state.CdRead` unset) whose
+folder isn't the one the file is in is read again (`ccStale`). Magpie's own
+project move rewrites `relocatedCwd` and judges the session by its last
+move. See `TestClaudeCdListedUnderNewFolder` and the fixtures in
+`internal/sessions/testdata/claude-cd` (Claude Code 2.1.316's own lines,
+usrname1833 on Discord).
 Gateway projections have no path,
 resume command or terminal action: the agent's own files of them are not on
 this computer. Their rows carry `gateway: true`; the Sessions page groups them
@@ -84,7 +153,15 @@ is some. The overview's top summaries (`MergeExternalStats`) carry
 where a folder would be, with "(prompt not recorded)" when no text was kept,
 so it doesn't read as a native session with an empty prompt (#2285: a Pi
 subagent whose session file is in a temp folder). Verification:
-`TestTopSessionsMarkWhatOnlyTheGatewaySaw`, `sessions-overview.test.cjs`. Their
+`TestTopSessionsMarkWhatOnlyTheGatewaySaw`, `sessions-overview.test.cjs`.
+`/api/sessions` makes a row only of the gateway sessions its limit can
+show: `usage.EachGatewaySession` walks the projection newest first without
+a copy, `listedExternal` stops at the limit, and `sessions.EachMerged`
+makes each row when the merge reaches it. Every one of ~10k gateway
+sessions past the natives' cap was copied three times and made a row on
+each poll while a session grew. Verification:
+`TestSessionsListMakesOnlyTheGatewayRowsItShows`,
+`TestEachMergedMakesOnlyTheRowsItReaches`. Their
 models, token totals, start/last timestamps and effective prices come from the
 same usage records used by Usage and stats endpoints.
 
@@ -96,9 +173,30 @@ record by its own model and keys its day and model rows by the alias, and
 [`alias.go`](../../internal/sessions/alias.go)) merge a native session's rows
 the same way, into new slices so the memo is never changed. The alias is read
 before any lock, and an unreadable settings.json keeps the last aliases read.
-Requests, the Requests ledger and model lists keep each call's own id.
+Found routing groups are also merged under their public `auto/<model>` id
+by this mapper: a native file or old usage row naming `group/auto-<slug>`
+and one naming `auto/<model>` form one model option. Vendor spellings of
+`auto/<model>` follow `PublicRef`; effort and `[1m]` suffixes are preserved.
+The mapping is a snapshot taken before usage locks and before grouping,
+so lists (`ListAgent` and `Manage` too), details, daily stats, summaries,
+filtered overviews and Codex's model/effort rows agree. Original parses,
+ledger rows and prices stay intact.
+An unavailable group or a user's pre-existing provider named `auto` keeps
+its original names. User usage aliases are applied after public spelling.
+`UsageNamesKey` invalidates named caches when the group catalog changes.
+
+Requests keep their original priced model ids internally; their model shares,
+chart legends and model filters treat both routing-group ids as one (the
+filter's model is made the kept `group/auto-…` once, in `usageapi.FilterOf`,
+so only an `auto/…` record reads the providers), and
+`usageapi.LedgerPage` displays the public spelling for both `model` and `req`.
+This does not apply user usage aliases to Requests. A clear made under either
+group id covers both spellings. Model lists continue to use the catalog ids.
 Verification: `TestUsageAliasCountsTwoIdsAsOne`,
-`TestSessionsCountAliasedModelsAsOne`, `TestAliasStatsLeavesItsInputAlone`.
+`TestSessionsCountAliasedModelsAsOne`, `TestAliasStatsLeavesItsInputAlone`,
+`TestSessionsFoundGroupNames`, `TestSessionsAPIFoundGroupNames`,
+`TestUsageFoundGroupNames`, `TestCodexEffortFoundGroupNames`,
+`TestLedgerFoundGroupNames`.
 
 The Usage page can clear its figures (CrazyMouse_TT on X): a model's row's
 "…" has "Clear usage…", and "Clear all usage…" sits under the lists. Each
@@ -147,6 +245,46 @@ capabilities to a gateway row. Verification: `TestDesktopSessionTitles`,
 `TestDesktopSessionTitleIdentity`, `TestDesktopSessionTitleHandles`,
 `TestDesktopSessionTitleInStats`, `TestDesktopTitlesReadOncePerList`,
 `TestDesktopSessionTitlesOnPages`.
+
+A ZCode request names its session without the `sess_` prefix ZCode's
+database gives it, so `Titles` looks a `zcode:` key up under both and
+answers under the id asked for (#5195). Verification:
+`TestZCodeTitlesByRequestID`.
+
+Routing's stage names the session an account is serving (connor_yang on
+Discord): a row answering, or that answered, the request shown adds that
+request's session title after its status, on one line cut short with the
+whole line under the pointer. The title is what the list's By session heads
+use, from the same `/api/gateway/session-titles`: `sessions.Titles` by
+agent:id for every agent but Codex, Codex's name index by thread id (its
+parent's, for a subagent Codex names one for). The page keeps both by session
+id (`otherTitles`, `codexNames` in
+[`client.js`](../../internal/gui/assets/plugins/routing/client.js)), since each
+trace update brings its routes anew; a session not seen yet is asked about
+once (`askUnnamed`, skipped when a read since has taken it), and the rest
+with the list's 15-second refresh, never on the stage's per-second passes. A
+names reply silent on a Codex session (unknown to the index, or the index
+unread) leaves the title the trace brought, and only a reply that names it
+changes it. A session with no title says nothing more, and
+neither does a Codex request whose parent was only matched by its prompt
+(`parentMatched`), since that match is a guess. Verification:
+`routing-session-title.test.cjs`.
+
+A By session head reads as its title (flandern1211_58540 on Discord: a
+folder and an id told nothing): the agent, then the session's title on one
+line (whitespace folded), then its folder in a quieter `.dir`; with no title
+the folder takes its place, and with neither the id. The tooltip keeps the
+title, the folder and the id. Where `sessions.Titles` and Codex's name index
+find nothing, the same endpoint falls back to the first prompt the gateway
+recorded for that session (`sessions.GatewayTitler`, the title its list
+shows), looked up under the agent the page names and the one the gateway
+records it under (`usage.AgentOf`): `withGatewayTitles` and
+`codexReadableTitles` in [`trace.go`](../../internal/gui/trace.go). Codex
+ids the index doesn't name go to `sessions.Titles` as `codex:` keys first,
+so a rollout's own first prompt names it. Nothing is read that the page
+couldn't already show on the Sessions page, and nothing leaves the local
+GUI. Verification: `TestSessionTitlesFallBackToFirstPrompt`,
+`routing-session-folder.test.cjs`.
 
 A gateway projection can be deleted (lc on Discord). `sessions.DeleteGateway`
 moves its recorded text folders (`gateway-conversations/<date>/<identity hash>`)
@@ -240,6 +378,43 @@ choice from the CLI (`sessionReadsTo`); while it is not asked,
 says how (`sessNothing`). Tests: `TestSessionsRead`,
 `TestSessionsNotAskedSaysHow`.
 
+In gateway mode (`magpie web`'s page, [`gatewaymode.go`](../../internal/gui/gatewaymode.go))
+no agent's own session files are read, whatever `SessionReads` says
+(paultian on Discord: a server put in gateway mode with agents installed
+listed its own sessions beside those other computers sent). The gui sets
+`sessions.OwnOff` to `ownSessionsOff`, and `currentReads` answers "none"
+while it holds, so `Reads`, `allowed` and every route above (the list,
+`one`, `transcript`, `markdown`, `export`, stats, the overview, search,
+`manage`, delete, carry, the Codex provider move, and Usage's agent-file
+calls) see no local session; `Found` and `Dirs` are empty, the
+trash lists and restores only what the gateway kept, and moving Claude
+Code's project folder is refused (`ErrNotRead`). Gateway-recorded
+sessions (the ledger's projection and the recorded conversations) are not
+behind this gate and still show, a local agent's that went through this
+gateway among them. `ownSessionsOff` asks `settings.Shared()` and an
+agents look kept for 30 s, as it is asked on every read, and when its
+answer turns it resets the sessions' caches and the stats
+(`forgetOwnSessions`), as `POST /api/settings/gateway-mode` does at once.
+`/api/sessions/reads` says `gateway: true` then: the Sessions page asks
+nothing, its empty state says the sessions shown are those of other
+computers' agents that use this gateway, and Settings › Privacy leaves
+*Agents' session history* out. A session is listed only when its
+requests name one in a header (`sessionOf`: `X-Magpie-Session`, or the
+agent's own, `sessionHeaders`), under the agent its User-Agent names
+(`usage.AgentOf`, magpie's agents and plugins' agents; another client by
+its product name).
+The stats' `keys` name these sessions too (`MergeExternalStats`), since
+Usage › Sessions lists only the keys it is given (linkaww on Discord: a
+Docker magpie in gateway mode listed almost none;
+`TestGatewayStatsNameTheGatewaySessions`,
+`TestGatewayModeStatsNameTheGatewaySessions`). Usage › Context's Tuned for
+you is left out (`/api/tune` says `gateway: true`, and Use and Undo are
+refused): it replays this computer's agent files, so it said Claude Code
+made 0 requests (`TestTuneInGatewayModeIsLeftOut`,
+`context-tune-gateway.test.cjs`).
+The app's windows are never in gateway mode. Tests:
+`TestGatewayModeListsNoOwnSessions`, `gateway-mode-sessions.test.cjs`.
+
 What is read either way: the gateway's own usage ledger, its
 projections and the conversations it recorded (they are magpie's own),
 the agents' config and sign-in files, Claude Code's and Codex's
@@ -284,7 +459,9 @@ affinity see the request as the client sent it. The existing protocol
 readers handle Chat, Anthropic, Responses and Gemini; streaming replies use the
 existing decoders, with completed Responses items retaining custom tool calls.
 Only content actually sent through the gateway is available. Images are shown
-as placeholders; hidden reasoning, client-only operations and unsupported wire
+as placeholders, their base64 taken out before the 8 MiB input cap
+(`leanImages`), so a turn of pictures keeps its text (matrix0487 on Discord;
+`TestFileIDConversationStillShows`); hidden reasoning, client-only operations and unsupported wire
 items cannot be reconstructed. This is not a raw request archive or remote
 session synchronization, and existing S3 archives are not imported.
 
@@ -473,11 +650,23 @@ summary and gets the ledger filtered to its own `CallerKey`, with its filter
 lists cut to its own rows (`usageapi.OwnPage`): the ledger's facets are drawn
 from every call in the period, so without the cut they would name other keys.
 `TestUsageOverGateway` covers both, and a red when either cut is removed.
+Each gateway row keeps the address its request came from
+(`Record.ClientIP`, set in `appendUsage` from `peerAddr`: the connection's
+own, never a forwarding header). The window's `/api/usage/requests` has it
+for the Usage page's request detail; `/v1/magpie/usage/requests` takes it
+out for every caller (`withoutClientIPs`), and sync's `OwnDays` leaves it
+out, so it never leaves this computer. CSV export, OTel and middleware
+points name their columns and don't carry it. `rowText` packs it, or the
+ledger's cache reads it back empty
+(`TestUsageRowsKeepTheClientsAddress`, `TestClientIPKeptHereNotShared`).
 A held key is refused (`refuseHeld`, 403 `provider.KeyHeldCode`) the
 quotas, their history, kept cards and refresh, and `/v1/magpie/concurrency`
 (#1981); `/v1/magpie/route` tells it only routes whose `callerKey` is its
-own. `Route.callerKey` is set by `trace.beginFor` from the request's
-caller, so a route begun without it is told to no held key.
+own. `Route.CallerKey` (and `CallerKeyName`, the key's name then; never
+its secret) is set by `trace.beginFor` from the request's caller, so a
+route begun without it is told to no held key. Both go out in the GUI's
+trace and the routing history, and the Routing list's By key groups by
+them (`TestTraceNamesCallerKey`, `routing-by-key.test.cjs`).
 `TestHeldKeyToldNoAccounts` covers every one of these from loopback and
 the LAN, for a key held each of the three ways and one held to nothing.
 A held key whose owner set `access.Key.Quotas` (#2216) is told the four
@@ -493,6 +682,28 @@ cards only, and a scope with no card answers the cards routes as held.
 a key with some of a provider's models, an account-held key, a provider's
 only key, and a key told nothing, each red when its check is removed.
 
+### Bandwidth
+
+Each gateway request's row keeps `UpBytes` (the bytes its tries put on the
+wire, `sentUp`) and `DownBytes` (the bytes read from the vendors' replies,
+counted per `Read` by `downCount`, so a stream is counted as it arrives and
+nothing is buffered). The same two places add to the gateway's running
+totals (`Server.Traffic`, atomic, in
+[`upbytes.go`](../../internal/gateway/upbytes.go)), so the totals and the rows
+count the same bytes once. Rows sum into `Totals` and into each chart
+point's `Part` (`add` from rows, `plus` from the request page's cells).
+The Requests chart's Traffic metric draws them per hour/day by model,
+provider or agent. `GET /api/usage/traffic` answers the totals with the
+requests in flight (`{}` when another magpie serves the gateway); the
+Requests card reads it a second apart while it is shown and says
+"↑ x/s · ↓ y/s" over the last ~3s while requests are in flight. Not counted:
+Claude bridge turns (no HTTP to the vendor), and a plugin's row counts the
+local hop to the plugin host. An upload is counted when its try is sent, so
+a large body shows as a burst. `TestTrafficCountsWhatRowsCount`,
+`TestTrafficCountsAStreamAsItFlows`, `TestSeriesPartsKeepBytes`,
+`TestUsageTrafficSaysWhatTheGatewayCounted` and `usage-traffic.test.cjs`
+cover it.
+
 ### Calls read from the agents' own files
 
 A call an agent made without magpie reaches Usage only when its own files
@@ -501,7 +712,12 @@ are read (`sessions.Calls`, from `callSources` in
 Code's, Claude Desktop's and Cowork's, Codex's (and both in WSL), and,
 read a file at a time (`wholeCallReaders` in
 [`call_cache.go`](../../internal/sessions/call_cache.go)), OpenCode's
-(#680), ZCode's, DeepSeek Harness's (`dsh`), WorkBuddy's, CodeBuddy
+(#680), ZCode's, DeepSeek Harness's (`dsh`), WorkBuddy's, WorkBuddy
+AI's (the international build's own `~/.workbuddy-ai`, read as
+WorkBuddy's with its own models.json, listed and deletable under its own
+name, and read once as WorkBuddy's when it is a link to `~/.workbuddy`:
+`TestWorkBuddyAI`, `TestWorkBuddyAIGatewayIsItsOwn`,
+`TestWorkBuddyAISessionsListedUnderTheirName`), CodeBuddy
 Code's (#1779; its sessions are on the Sessions page too, from the same
 `projects/<cwd>/<id>.jsonl` files read as WorkBuddy's, resumed with
 `codebuddy --resume <id>` and deletable, #2657: `TestCodeBuddy`,
@@ -521,7 +737,42 @@ too ("usage" and omp's "model_usage" entries, a compaction's, a branch
 summary's and a tool result's usage, on the model and provider in use);
 the provider `magpie` (or `dial`) is magpie's entry, a failed call has no
 usage, and a fork's copy of its parent's entries (written before its
-header) is the parent's. The other agents the Sessions page reads (Cline,
+header) is the parent's. A Codex fork (/fork, a spawn_agent with the
+parent's context) writes every line of its parent's rollout into its own
+first, token_count events included, stamped at the fork's time; its
+session_meta names the parent (`forked_from_id`), and a checkpoint the
+parent's rollout holds (its total and last call alike) is the parent's,
+on Usage and Sessions both (`codexRolloutOf`, `codexCheckpointsOf` in
+[`codex_fork.go`](../../internal/sessions/codex_fork.go)). The copies
+are the head of the fork only: its first turn the parent never had (a
+`turn_id` of its own) ends them, so a call of the fork's own is counted
+even when its numbers are those of one the parent made after the fork.
+A `rollout-<n>` turn id is not a turn of the fork's own: codex-rs names
+a turn that has no id of its own that way (its canonicalizer for older
+rollouts, its thread-history builder), and a copied head can hold one
+the parent doesn't (`ownTurn`).
+The parent is
+looked for in the same Codex home, by the UUIDv7 day of its id, then
+every day, then `archived_sessions`; one not found leaves the fork read
+as before. A ZCode side chat, fork or restored checkpoint copies its
+session's messages with new ids and the originals' times and tokens,
+each naming its original in `metadata.forkOrigin.messageId`; a copy
+whose original is still in the database is not counted (`zcDB.copied`
+in [`zcode.go`](../../internal/sessions/zcode.go)), one whose original
+is gone is. The message without a `forkOrigin` is the session's own and
+is counted: copies are marked by row, since a row's id is in its own
+column and not in its data (v0.1.2847 marked them by that empty id and
+left out every call of a fork that held one copy). Both came from Sky
+(skyhuang1994): a ZCode side chat put a
+10-31 session's 0.42B tokens on 10-31 again, and a week of gpt-5.4 read
+5.1B tokens; then a ZCode fork's 11,409 calls of its own (3.49B tokens)
+went missing. Verification: `TestCodexForkCountsOnlyItsOwnCalls`,
+`TestCodexForkWithoutItsParentCountsTheCopies`,
+`TestCodexForkThatWentOnWorkingKeepsItsOwnCalls`,
+`TestZCodeCopiesCountedOnce`,
+`TestZCodeForkThatWentOnWorkingKeepsItsOwnCalls`. OpenCode's fork copies the same way with
+no pointer to the original, and is still counted twice (#5072).
+The other agents the Sessions page reads (Cline,
 Qoder, Grok, Droid, Cursor, Hermes, Alma) have no reader yet (#1607). The
 Context page reads the gateway's own traces, so it shows none of these
 calls. Verification: `TestMiniMaxCodeCalls`, `TestKimiCode*` (the
@@ -553,6 +804,24 @@ Verification: `TestAgySessions`, `TestAgyTitleLater`, `TestAgyGrows`,
 `TestAgyTranscript`, `TestAgyFolder`, `TestAgyRowOnly`, on conversations agy 1.3.5 and 1.4.7
 wrote in a sandbox.
 
+The Antigravity desktop app's stable and Insiders stores are read by
+[`antigravity_app.go`](../../internal/sessions/antigravity_app.go):
+`~/.gemini/antigravity/conversations/*.db` and
+`~/.gemini/antigravity-insiders/conversations/*.db`. Both use the existing
+`antigravity` session-reading choice and agent on Sessions and Usage;
+`Found` detects an Insiders-only install, and `Dirs` lists each existing
+store. Each conversation takes its title and workspace from the
+`conversation_summaries.db` beside its own store, including later title
+updates. Model calls reuse the app's read-only SQLite/protobuf reader,
+including response folding and gateway matching. Insiders session ids
+have an `insiders-` prefix in magpie, leaving stable ids unchanged and
+keeping equal UUIDs in the two stores from sharing a session or call id.
+The files themselves are not renamed. Sessions stay read-only with no
+terminal resume command; encrypted conversation text is not read.
+Verification: `TestAntigravityInsidersSessions` covers Insiders alone,
+both stores with the same UUID, per-model tokens, call ids, summary refresh
+and turning the existing reading choice off, using #2190's real step bytes.
+
 A read of every call decodes each file's cached shard, and over a long
 history that is tens of thousands of files (#2278: 68k shards, 415 MB).
 Asks for the same calls while one read is under way wait for it and get
@@ -580,7 +849,7 @@ one record or an array of up to 5000 (32 MiB at most), in `usage.jsonl`'s
 shape: `t`, `agent`, `provider`, `model` and `rid` are required; `in`,
 `out`, `cache_read`, `cache_write`, `cache_write_1h`, `reasoning`, `ms`,
 `ttft_ms`, `first_text_ms`, `flow_ms`, `status`, `cost`, `effort`,
-`session` and `err` are optional.
+`session`, `err`, `req` and `served` are optional.
 Any other field, a quoted number, a negative or out-of-range count, a time
 more than an hour ahead or before 2000-01-01T00:00:00Z refuses the whole
 post with a 400 that names the record (`error.index`) and the field
@@ -603,6 +872,13 @@ however old, so a client's history can be backfilled.
   was appended since. The reply counts `accepted` and `skipped` and gives
   each record's `index`, `rid` and `status`, so a re-run of a batch is
   safe.
+- **Asked and answered:** `req` and `served` (#3534) are `Record.Requested`
+  and `Record.Served`, the Requests page's requested and served model:
+  what the client asked for (an alias, a group) and what its vendor's
+  reply said answered. Each is checked as `model` is (a string, at most
+  256 characters, no control characters) and kept only as sent; a record
+  without `served` says nothing of what answered, so it is never filled
+  from `model`. `TestUsageIngestRequestedAndServed`.
 - **Pricing:** a record with `cost` keeps it (`Record.OwnCost`, the
   `rowOwnCost` flag on a packed row). Without one it is priced at magpie's
   own prices, like a gateway row.
@@ -611,7 +887,9 @@ however old, so a client's history can be backfilled.
   speed is `usage.DecodeOf`'s, as a gateway row's is, on the server
   (`Row.Decode`, the totals' `DecodeN`) and in `page.js`'s `ledDecode`. A
   row that reasoned tells none without `first_text_ms`; `ThinkPace` and,
-  with `flow_ms`, `HeldShare` tell a reply let go in a burst. `first_text_ms`
+  with `flow_ms`, `HeldShare` tell a reply let go in a burst, as does
+  `HeldWindowMs`: a window under a second after a wait over four times
+  longer. `first_text_ms`
   may not be before `ttft_ms` (the first text is content too) or after `ms`;
   `flow_ms` is the middle 80% of the content's time scaled by 10/8, as
   `firstToken.flowMs` measures it, so it is bounded by `ms` × 10/8, not
@@ -630,6 +908,60 @@ however old, so a client's history can be backfilled.
 `TestUsageIngest*` and `TestIngestReported*` cover these, including
 concurrent posts beside the gateway's own writes, and a backfill of a full
 5000-record batch landing on the right 7d/30d/all days.
+
+### Calls to magpie's own MCP tools
+
+An agent's call to a tool of one of magpie's own MCP servers is a row of
+`usage.jsonl` too (ferock on Discord): the image server's
+`generate_image`, `generate_video` and `generation_result`, vision, web
+search, plugin tools and the router's. The row has `source: "mcp"`,
+`kind: "mcp"`, operation `execute_tool`, the tool's name as `req`, the
+server's name as `host` (`magpie-image`, `magpie-vision`,
+`magpie-web-search`, `magpie-tools`, or the Library server a router tool is
+of), the agent, the provider and model of the last gateway request the
+call made, its duration, its endpoint (the server's path, `stdio` for the
+Magpie Image server an agent runs) and, when it failed, the JSON-RPC
+error or the `isError` result's first text, clipped by `keepMsg`. Its
+arguments are never kept, not even masked.
+
+- **Written by:** `serveMCP` for every `tools/call` (`callMCPTool` in
+  [`mcp_calls.go`](../../internal/gateway/mcp_calls.go)). The call's
+  context carries an `mcpUse`, which `appendUsage` fills with each model
+  row's provider and model; the image server's jobs keep it, so a
+  `generation_result` names the model of the job it waited on. A drawing
+  still running when its call answers leaves that call's row without a
+  model. The stdio Magpie Image server calls the gateway's `/v1/images`
+  and `/v1/videos` itself, so it reports each call it answered to the
+  gateway's image MCP server with the JSON-RPC method `magpie/toolCalled`
+  (`gateway.MCPCalledMethod`, params `MCPCalled`: tool, ms, model,
+  error); a tool not Magpie Image's is -32602. Behind the [MCP router](mcp-router.md) it sends none: the router's `tools/call` is the row. An older gateway that
+  doesn't know the method just leaves the call unlisted.
+- **Counted nowhere:** `Record.IsProbe` is true for these rows, so they
+  ride the probe lane above: listed (`probeChunk`, kept as they are),
+  never in a total, chart, budget (`budget.counts`) or `Load`. The model
+  requests a call made are rows of their own and count as any. The
+  index's provider hosts skip them (`sawHost`), as their host is a
+  server's name.
+- **On the page:** the Requests row has an `MCP` badge (`.src.mcp`,
+  muted, no stripe) whose tooltip names the agent, tool and server and
+  says the arguments are not kept; the Where cell is the provider and the
+  server, the Requested cell the tool, and the status Succeeded or
+  Failed. The Purpose filter names `kind:mcp` "MCP tool"
+  (`purposeKinds`, `purposes.js`).
+
+`TestMCPToolCallIsARequestRow`, `TestMCPHubCallIsARequestRow`,
+`TestMCPCalledFromStdioIsARow` and the others in `mcp_calls_test.go`,
+`TestToolCallsAreReported` (imagemcp), `TestMCPCallRowsListedNotCounted`
+(usage) and `usage-ledger-mcp.test.cjs` cover it.
+
+A request a provider plugin sends its vendor by itself (Devin's cache
+keep-alive ping, plugins#592) never passes the gateway. The plugin
+reports it through `input.magpie.usage` and `usage.pluginCall` writes it
+as a row of agent `magpie` with the plugin's kind (`cache_keepalive`,
+"Cache keep-alive" in `purposeKinds`). Unlike a probe it is counted:
+priced and in every total (see
+[provider-plugins.md](provider-plugins.md#a-request-a-plugin-sends-by-itself)).
+`TestPluginKeepaliveIsCounted`.
 
 ### Requests magpie sends on its own
 
@@ -662,7 +994,8 @@ for: `provider_test`, `api_detect` or `model_list`
   all leaves them out.
 - **A model list answered is no row:** magpie fetches lists by itself
   (start-up's `FetchNew`, the panel's and the Providers page's, and
-  `KeepListsFresh`, which asks a Remote magpie every 10 minutes), so a
+  `KeepListsFresh`, which asks a Remote magpie every 10 minutes, and
+  `KeepRemoteListsFollowed`, as soon as its list changes there), so a
   `model_list` row with a 2xx/3xx status and no error is neither written
   (`usage`'s `probelog.Sink`) nor read back from an older log
   (`quietProbe`, in the index's parse): ferock on Discord, a Requests page
@@ -812,6 +1145,23 @@ not listed is an error. See `TestClaudeSubagents`, `TestQoderSubagents`,
 `TestKimiSubagentTask`, `TestSubagentTaskReadOnlyWhenTheFileChanges`,
 `TestSubagentWithMetaTaskIsNotReadForIt`, `TestStatsReadNoSubagentFile` and
 `TestSessionSubagentTranscript`.
+
+A session's listed `resume` line is made on every listing and reads no more
+than the listing did. The line that runs when the user opens it, from the
+GUI's Terminal or the TUI, is `sessions.ResumeNow` ([`codex_resume.go`](../../internal/sessions/codex_resume.go)).
+Codex 0.166 resumes a thread only on the provider it was saved with (its
+state-database row, else its `session_meta`): on another, `codex resume`
+stops at `modelProviderMismatch`, and at `modelProviderNotConfigured` when
+config.toml has no table of that provider any more, and no flag lets a
+resume go on another provider (codex-rs `config_manager.rs`
+`load_for_resume`). So a Codex thread saved on a provider other than the
+one Codex is on runs as `codex resume -c model_provider=<its provider> <id>`
+while config.toml has that table, or it is a built-in (`openai`, `ollama`,
+…), and Codex runs it embedded, on its own provider; when the provider is
+gone, `MoveCodexProvider` moves it to the one Codex is on first (its files
+in magpie's trash), and it resumes there (mrten_95615 on Discord). A WSL
+distro's Codex session is as listed. `TestCodexResumeOnItsProvider`; both
+cases were resumed by a real Codex 0.166.0 in a sandbox `CODEX_HOME`.
 
 The Sessions page draws only main sessions on top. A session's subagents are
 folded under its row ("2 subagents"); unfolded, each is a row of its task and

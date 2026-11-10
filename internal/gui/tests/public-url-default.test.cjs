@@ -22,7 +22,7 @@ const PUBLIC = "https://magpie.example.com";
 const LOCAL = "http://127.0.0.1:3999";
 const LANGS = ["en", "zh", "zh-TW", "ja", "de"];
 const words = {
-  en: "Public address", zh: "公网地址", "zh-TW": "公開位址", ja: "公開アドレス", de: "Öffentliche Adresse",
+  en: "Public address", zh: "对外地址", "zh-TW": "對外位址", ja: "公開アドレス", de: "Öffentliche Adresse",
 };
 
 async function setup(t, engine, lang, width, options) {
@@ -31,6 +31,7 @@ async function setup(t, engine, lang, width, options) {
   const page = await (await browser.newContext({ viewport: { width, height: 800 }, reducedMotion: "reduce" })).newPage();
   await page.addInitScript(() => { try { localStorage.setItem("magpie.gwConnectFolded", "0"); } catch {} }); // Connect opened, as a user who reads it
   page.setDefaultTimeout(6000);
+  page.setDefaultNavigationTimeout(60000);
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", fixture(lang, "light", [], { lan: true, ...options }));

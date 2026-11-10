@@ -497,12 +497,18 @@ func TestFindCodexApp(t *testing.T) {
 		9:     {{PID: 3, Args: "codex"}, {PID: 4, Args: "/Users/me/.codex/packages/app-server-daemon/releases/0.162.0-aarch64-apple-darwin/bin/codex app-server --listen unix:///x --managed-daemon"}, {PID: 9, Args: app}},
 		8:     {{PID: 8, Args: `"C:\Program Files\WindowsApps\OpenAI.Codex_1.0\app\resources\codex.exe" app-server`}},
 		61552: {{PID: 3, Args: `C:\Users\yeton\AppData\Local\Microsoft\WinGet\Links\codex.exe`}, {PID: 61552, Args: codexWindowsAppServer}},
+		// the Linux app's, beside npm's codex running an app-server of
+		// its own (pota on Discord: no account switch for it on Linux)
+		1957170: {{PID: 3, Args: "/usr/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex/codex app-server"}, {PID: 1957170, Args: codexLinuxAppServer}},
 		0: {
 			{PID: 3, Args: "codex app-server proxy"},
 			{PID: 5, Args: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex exec-server --remote x"},
 			{PID: 6, Args: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server daemon restart"},
 			{PID: 7, Args: "/Users/me/.vscode/extensions/openai.chatgpt-1.0/bin/darwin-aarch64/codex app-server"},
 			{PID: 10, Args: "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService app-server"},
+			{PID: 11, Args: "/usr/lib/chatgpt/ChatGPT --type=renderer"},
+			{PID: 12, Args: "/home/me/.local/bin/codex app-server"},
+			{PID: 13, Args: "chatgpt/resources/codex app-server"},
 		},
 	} {
 		if got := findCodexApp(ps); got != want {
@@ -577,6 +583,55 @@ func TestCodexAppStale(t *testing.T) {
 	}
 }
 
+// An app-server that went with none started in its place left the app
+// with nothing that read the new sign-in (蛋仔 on Discord, Windows: "Codex
+// app-server process is not available" till Codex was reopened): while
+// the app runs, that is still said; once it quits, or it starts another,
+// it isn't.
+func TestCodexAppStaleWhileNoServerCameBack(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	server, open := 60, true
+	oldList, oldOpen := listProcesses, CodexAppOpen
+	t.Cleanup(func() {
+		listProcesses, CodexAppOpen = oldList, oldOpen
+		DismissCodexDaemon()
+		DismissCodexApp()
+		codexApp.Lock()
+		codexApp.switched = false
+		codexApp.Unlock()
+	})
+	listProcesses = func(context.Context) ([]proc.Process, error) {
+		if server == 0 {
+			return nil, nil
+		}
+		return []proc.Process{{PID: server, Args: codexWindowsAppServer}}, nil
+	}
+	CodexAppOpen = func(context.Context) (bool, bool) { return open, true }
+	recheck := func() { codexDaemonMu.Lock(); codexDaemonChecked = time.Time{}; codexDaemonMu.Unlock() }
+	DismissCodexApp()
+
+	noteCodexSwitch("a@x", "b@x")
+	server = 0 // ended, and the app started none
+	recheck()
+	if got := CodexAppStale(); got != "a@x" {
+		t.Fatalf("app open with no app-server: got %q, want a@x", got)
+	}
+	open = false
+	recheck()
+	if got := CodexAppStale(); got != "" {
+		t.Fatalf("app quit: %q", got)
+	}
+
+	open, server = true, 60
+	noteCodexSwitch("a@x", "b@x")
+	server = 61
+	recheck()
+	if got := CodexAppStale(); got != "" {
+		t.Fatalf("a new app-server: %q", got)
+	}
+}
+
 // The daemon magpie restarts runs with the login shell's proxy and PATH,
 // as one a terminal started would (guotianci6 on X): magpie opened from
 // the desktop has neither.
@@ -623,5 +678,49 @@ func TestCodexPIDsFindsOpenCodex(t *testing.T) {
 	listProcesses = func(context.Context) ([]proc.Process, error) { return nil, errors.New("ps failed") }
 	if got := CodexPIDs(context.Background()); got != nil {
 		t.Fatalf("a failed list gave %v", got)
+	}
+}
+
+// CLJY (Discord): before npm updates Codex on Windows, magpie stops the
+// app-server daemon when no codex session is on it, since it holds the
+// package's codex.exe, which npm can't remove while it runs. One with a
+// session on it, or none running, is left.
+func TestStopIdleCodexDaemon(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for codex")
+	}
+	fakeDaemon(t)
+	out := fakeCodex(t, 0)
+	home := codexHome()
+	clients, daemon := 0, true
+	listProcesses = func(context.Context) ([]proc.Process, error) {
+		var ps []proc.Process
+		if daemon {
+			ps = append(ps, proc.Process{PID: 50, Args: home + "/packages/app-server-daemon/releases/0.162.0/bin/codex app-server --listen unix:///x --managed-daemon"})
+		}
+		for i := range clients {
+			ps = append(ps, proc.Process{PID: 100 + i, Args: "codex"})
+		}
+		return ps, nil
+	}
+	ran := func() string {
+		b, _ := os.ReadFile(out + ".args")
+		os.Remove(out + ".args")
+		return strings.TrimSpace(string(b))
+	}
+	ctx := context.Background()
+	if stopped, err := StopIdleCodexDaemon(ctx); !stopped || err != nil || ran() != "app-server daemon stop" {
+		t.Fatalf("idle daemon: stopped %t, %v", stopped, err)
+	}
+	if b, _ := os.ReadFile(out + ".home"); strings.TrimSpace(string(b)) != home {
+		t.Errorf("CODEX_HOME %q, want %q", b, home)
+	}
+	clients = 1
+	if stopped, err := StopIdleCodexDaemon(ctx); stopped || err != nil || ran() != "" {
+		t.Fatalf("a session on it: stopped %t, %v", stopped, err)
+	}
+	clients, daemon = 0, false
+	if stopped, err := StopIdleCodexDaemon(ctx); stopped || err != nil || ran() != "" {
+		t.Fatalf("no daemon: stopped %t, %v", stopped, err)
 	}
 }

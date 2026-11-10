@@ -1,6 +1,7 @@
 package sessions
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -113,6 +114,79 @@ type ocMessage struct {
 	Semantics *struct {
 		Origin string `json:"origin"`
 	} `json:"semantics"`
+	// OpenCode 2: the tools a reply called and the skills a message
+	// brought in, as ocV2DB.messages reads them
+	Calls []ocUse `json:"calls,omitempty"`
+	// ZCode: where a message copied into another session came from
+	// (zcDB.copied)
+	Metadata *struct {
+		ForkOrigin *struct {
+			SessionID string `json:"sessionId"`
+			MessageID string `json:"messageId"`
+		} `json:"forkOrigin"`
+	} `json:"metadata,omitempty"`
+}
+
+// ocUse is a tool called, or a skill brought in with no tool (Name "").
+type ocUse struct {
+	Name  string `json:"name,omitempty"`
+	Skill string `json:"skill,omitempty"`
+	At    int64  `json:"at,omitempty"`
+}
+
+// ocV2Calls is what an OpenCode 2 message's data says was called. A
+// reply's content has a {"type":"tool","name",…,"state":{"input"}} for
+// each tool, the skill tool's input {"id": <skill>}; a prompt whose skill
+// was picked (@<skill> in the TUI) lists it in skills [{"id","name",…}];
+// and a skill row, a skill brought in by itself
+// (POST /api/experimental/session/{id}/skill), names it in skill.
+func ocV2Calls(typ string, b []byte) []ocUse {
+	var d struct {
+		Content []struct {
+			Type  string `json:"type"`
+			Name  string `json:"name"`
+			State struct {
+				Input struct {
+					ID string `json:"id"`
+				} `json:"input"`
+			} `json:"state"`
+			Time struct {
+				Created int64 `json:"created"`
+			} `json:"time"`
+		} `json:"content"`
+		Skills []struct {
+			ID string `json:"id"`
+		} `json:"skills"`
+		Skill string `json:"skill"`
+	}
+	if json.Unmarshal(b, &d) != nil {
+		return nil
+	}
+	var out []ocUse
+	switch typ {
+	case "assistant":
+		for _, c := range d.Content {
+			if c.Type != "tool" || c.Name == "" {
+				continue
+			}
+			k := ""
+			if c.Name == "skill" {
+				k = c.State.Input.ID
+			}
+			out = append(out, ocUse{Name: c.Name, Skill: k, At: c.Time.Created})
+		}
+	case "user":
+		for _, k := range d.Skills {
+			if k.ID != "" {
+				out = append(out, ocUse{Skill: k.ID})
+			}
+		}
+	case "skill":
+		if d.Skill != "" {
+			out = append(out, ocUse{Skill: d.Skill})
+		}
+	}
+	return out
 }
 
 // ocPart is a part of a message: only its text is looked at, for a title.
@@ -276,7 +350,7 @@ func ocDBRows(db *sql.DB, query, agent, path string, store ocStore, parent map[s
 			continue
 		}
 		parent[id] = par
-		out = append(out, file{agent: agent, path: path + "#" + id, size: n, mod: ms(max(updated, last)), more: &fileMore{sid: id, oc: store}})
+		out = append(out, file{agent: agent, path: path + "#" + id, size: n, mod: modOf(ms(max(updated, last))), more: &fileMore{sid: id, oc: store}})
 	}
 	return out
 }
@@ -342,12 +416,12 @@ func (s ocV2DB) info(sid string) (ocInfo, bool) {
 	return i, err == nil
 }
 
-// messages are a session's prompts, replies and compactions: a reply's
-// model is its model's id, a compaction's (which may name none) the one
-// last replied with.
+// messages are a session's prompts, replies, compactions and skills
+// brought in by themselves: a reply's model is its model's id, a
+// compaction's (which may name none) the one last replied with.
 func (s ocV2DB) messages(sid string) [][]byte {
 	rows, err := s.db.Query(`SELECT id, type, data FROM session_message
-		WHERE session_id = ? AND type IN ('user', 'assistant', 'compaction') ORDER BY seq`, sid)
+		WHERE session_id = ? AND type IN ('user', 'assistant', 'compaction', 'skill') ORDER BY seq`, sid)
 	if err != nil {
 		return nil
 	}
@@ -375,9 +449,10 @@ func (s ocV2DB) messages(sid string) [][]byte {
 		if v.Model != nil && v.Model.ID != "" {
 			m.ModelID, m.ProviderID, m.Variant = v.Model.ID, v.Model.ProviderID, v.Model.Variant
 		}
+		m.Calls = ocV2Calls(typ, b)
 		switch typ {
-		case "user":
-			m.Role, m.ModelID, m.ProviderID, m.Variant, m.Tokens = "user", "", "", "", nil
+		case "user", "skill":
+			m.Role, m.ModelID, m.ProviderID, m.Variant, m.Tokens = typ, "", "", "", nil
 		case "assistant":
 			last, lastProvider, lastVariant = m.ModelID, m.ProviderID, m.Variant
 		}
@@ -432,8 +507,8 @@ func openCodeJSONFiles(root string) []file {
 			for _, e := range es {
 				if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() {
 					f.size += fi.Size()
-					if fi.ModTime().After(f.mod) {
-						f.mod = fi.ModTime()
+					if fi.ModTime().After(f.mod.Time()) {
+						f.mod = modOf(fi.ModTime())
 					}
 				}
 			}
@@ -485,7 +560,7 @@ func parseOpenCode(f file) *state {
 	}
 	s.ID, s.Cwd = info.ID, info.Directory
 	if t := title(info.Title); t != "" && !ocDefaultTitle(t) {
-		s.Named = t
+		s.own().Named = t
 	}
 	var msgs []ocMessage
 	for _, b := range f.m().oc.messages(f.m().sid) {
@@ -504,9 +579,12 @@ func parseOpenCode(f file) *state {
 	for _, m := range msgs {
 		at := ms(m.Time.Created)
 		s.saw(at, f.main)
+		for _, c := range m.Calls {
+			s.tool(cmp.Or(ms(c.At), at), c.Name, c.Skill)
+		}
 		switch m.Role {
 		case "user":
-			if typed := m.Semantics == nil || m.Semantics.Origin == "" || m.Semantics.Origin == "real_user"; typed && f.main && s.Title == "" && s.First == "" {
+			if typed := m.Semantics == nil || m.Semantics.Origin == "" || m.Semantics.Origin == "real_user"; typed && f.main && s.Title == "" && s.more().First == "" {
 				ocTitle(s, f.m().oc.parts(m.ID))
 			}
 		case "assistant":
@@ -516,6 +594,9 @@ func parseOpenCode(f file) *state {
 			}
 			if s.Cwd == "" && m.Path != nil {
 				s.Cwd = m.Path.Cwd
+			}
+			if z, ok := f.m().oc.(zcDB); ok && z.copied(m) {
+				continue // the original's session counts it
 			}
 			if t := m.Tokens; t != nil && m.ModelID != "" {
 				u := Tokens{Input: t.Input, Output: t.Output + t.Reasoning, CacheRead: t.Cache.Read, CacheWrite: t.Cache.Write}
@@ -546,12 +627,12 @@ func ocTitle(s *state, parts [][]byte) {
 		}
 	}
 	if t := strings.Join(typed, " "); strings.HasPrefix(strings.TrimSpace(t), "<") {
-		s.First = untagged(t)
+		s.own().First = untagged(t)
 	} else {
 		s.Title = title(t)
 	}
-	if s.Title == "" && s.First == "" {
-		s.First = untagged(strings.Join(other, " "))
+	if s.Title == "" && s.more().First == "" {
+		s.own().First = untagged(strings.Join(other, " "))
 	}
 }
 

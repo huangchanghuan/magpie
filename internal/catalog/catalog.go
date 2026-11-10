@@ -9,10 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -23,6 +23,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Model is one entry the picker can offer.
@@ -37,13 +38,19 @@ type Model struct {
 	// Keys, for a vendor whose keys each see models of their own, are the
 	// keys (by fingerprint) whose list has this one; empty is every key.
 	Keys []string `json:",omitempty"`
+	// EffortsBorrowed is set when Efforts are not the source's word but
+	// borrowed for its id (a plugin's model that thinks with no variants):
+	// a model listed by another id (provider's localIDs) borrows them for
+	// that id again.
+	EffortsBorrowed bool `json:"-"`
 	// APIs, when the vendor says, are the APIs the model is served on
 	// ("chat", "responses", "anthropic"); empty is not known.
 	APIs []string `json:",omitempty"`
 	// Endpoints, in magpie's own models for an agent, are the gateway
 	// paths a request for it is relayed on as it is
-	// (provider.NativeEndpoints, /v1/models' native_endpoints); none for a
-	// group or a model translated anyway.
+	// (provider.NativeEndpoints, /v1/models' native_endpoints); a group's
+	// are those every member relays (provider.GroupEndpoints), which
+	// /v1/models leaves out; none for a model translated anyway.
 	Endpoints []string `json:"-"`
 	// Images is set on a model that takes images as input.
 	Images bool `json:",omitempty"`
@@ -78,6 +85,15 @@ type Model struct {
 	// provider after it (magpie_label): the name Provider in model names
 	// Off has here (ARNO on Discord).
 	Plain string `json:",omitempty"`
+	// By, on a model of another magpie's list, is the provider that
+	// magpie names as serving it (magpie_by): its own provider's name, or,
+	// for a model it has from a magpie further on, the one there, the
+	// first in the chain. Its Remote magpie's upstream names (Provider's
+	// UpstreamProviders) say it after the model (lcc580 on X).
+	By string `json:",omitempty"`
+	// Via, on a model of another magpie's list, is the magpies it passes
+	// through to its vendor, that one last (magpie_via.go)
+	Via []string `json:",omitempty"`
 	// Apart, in a list magpie hands Codex, is what tells the model from
 	// another entry Codex's picker would call the same (two providers
 	// named Codex each serving GPT-6.1-Sol, nb5p on Discord): its
@@ -89,6 +105,14 @@ type Model struct {
 	// Fast is set on a model Codex may ask for priority processing (its
 	// Fast mode): one a ChatGPT account serves.
 	Fast bool `json:",omitempty"`
+	// Seals is set on a model whose provider seals a multi-agent V2
+	// lead's subagent tasks as the ChatGPT backend does: one of no sign-in
+	// on the Responses API (a relay of that backend, Sub2API or CPA,
+	// #1109; OpenAI's own API), or a group with such a member. With
+	// "subagents on any model" (settings.CodexAgentsV1) its Codex entry
+	// says V1 as the ChatGPT account's do (codexcat.Entries; brethhbbm on
+	// X: relay/gpt-6-astra kept its subagents).
+	Seals bool `json:",omitempty"`
 	// Tiers, in one ChatGPT account's own model list, are the service
 	// tiers its plan offers on the model ("priority", "ultrafast"); in
 	// another magpie's, the tiers it offers its Codex on the model
@@ -110,13 +134,19 @@ type Model struct {
 	// ChatGPT account answers for (provider.Entry's).
 	AgentsV2 bool `json:",omitempty"`
 	// Draws is set on a vendor-listed model that makes images (gpt-image-1,
-	// a relay's flux): kept with the list for Settings → Images, never
+	// a relay's flux): kept with the list for Settings → Models → Images, never
 	// offered to agents as a model to talk to.
 	Draws bool `json:",omitempty"`
 	// Films is set on a model another magpie lists as one it makes videos
 	// with (a Remote magpie's Grok Imagine Video): kept with the list for
 	// its videos API, never offered as a model to talk to or draw with.
 	Films bool `json:",omitempty"`
+	// Serves is set on a vendor-listed model made for an API other than
+	// chat, images or video (ServesEmbedding, ServesRerank, ServesSpeech,
+	// ServesTranscription): kept with the list for that API's routes and
+	// their groups of one kind (provider.KindGroup), never offered to
+	// agents as a model to talk to (#5339, XYenon on Discord).
+	Serves string `json:",omitempty"`
 	// Decides marks a decision model another magpie explicitly lists,
 	// including models whose ids don't name Jev.
 	Decides bool `json:",omitempty"`
@@ -133,6 +163,18 @@ type Model struct {
 	// Reasoning is set on a model that thinks, whether or not it takes
 	// levels: mimo-v2.6-flash thinks with a switch alone (#402).
 	Reasoning bool `json:",omitempty"`
+	// AlwaysThinks is set on a model its vendor's list says always thinks,
+	// with no way to turn it off: Kimi Code's supports_thinking_type
+	// "only" (reasoning.type). Kimi Code is told always_thinking for it.
+	AlwaysThinks bool `json:",omitempty"`
+	// DynamicTools is set on a model its vendor's list says loads tools
+	// mid-conversation: Kimi Code's supports_dynamic_tools
+	// (tools.dynamic_load). Kimi Code is told dynamically_loaded_tools.
+	DynamicTools bool `json:",omitempty"`
+	// DefaultEffort is the effort the vendor's list says the model thinks
+	// at when none is asked: Kimi Code's think_efforts.default_effort
+	// (reasoning.effort.default). "" is not said.
+	DefaultEffort string `json:",omitempty"`
 	// WebSearch is how another magpie (a Remote magpie) searches the web
 	// for the model when a web search tool is offered: "native", its own
 	// provider by itself, or "magpie", with that magpie's searcher; "" it
@@ -183,8 +225,38 @@ func imageInput(modalities []string) *bool {
 	if modalities == nil {
 		return nil
 	}
-	yes := slices.Contains(modalities, "image")
+	yes := slices.Contains(Kinds(modalities), "image")
 	return &yes
+}
+
+// Kinds is a list's modalities as models.dev words them (text, image,
+// audio, video, pdf), each once and in the order first met. A vendor may
+// list the media types it takes instead: OpenCode Go's /models gives
+// deepseek-v4.1-flash ["text","image/jpeg","image/png","image/gif",
+// "image/webp"] and Gemini's application/pdf, which read word for word
+// were no "image", so every model there that sees was taken for
+// text-only (zeo9901 on Discord). An unknown word is kept as it is; nil
+// stays nil, a list that said nothing.
+func Kinds(modalities []string) []string {
+	if modalities == nil {
+		return nil
+	}
+	out := make([]string, 0, len(modalities))
+	for _, m := range modalities {
+		k := strings.ToLower(strings.TrimSpace(m))
+		if typ, _, ok := strings.Cut(k, "/"); ok {
+			switch {
+			case typ == "image" || typ == "video" || typ == "audio" || typ == "text":
+				k = typ
+			case k == "application/pdf":
+				k = "pdf"
+			}
+		}
+		if k != "" && !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // Price is what a model costs, in USD per million tokens.
@@ -204,6 +276,11 @@ type Price struct {
 	// output above 272K), lowest first. models.dev lists them as "tiers" of
 	// type "context".
 	Tiers []Tier `json:"tiers,omitempty"`
+	// Peak, when set, says this is an off-peak price, billed at PeakFactor
+	// times it in Peak's hours (Price.In): a DeepSeek model's list price at
+	// a provider that bills by DeepSeek's hours. A price the user set has
+	// none.
+	Peak Peak `json:"peak,omitempty"`
 }
 
 // Tier is a price from a request's input size on: what the whole request
@@ -288,7 +365,7 @@ func OneHourFor(id string, p *Price) {
 
 // Times is the price at r times each of its parts.
 func (p Price) Times(r float64) Price {
-	out := Price{Input: p.Input * r, Output: p.Output * r, CacheRead: p.CacheRead * r, CacheWrite: p.CacheWrite * r, CacheWrite1h: p.CacheWrite1h * r}
+	out := Price{Input: p.Input * r, Output: p.Output * r, CacheRead: p.CacheRead * r, CacheWrite: p.CacheWrite * r, CacheWrite1h: p.CacheWrite1h * r, Peak: p.Peak}
 	for _, t := range p.Tiers {
 		out.Tiers = append(out.Tiers, Tier{Above: t.Above, Input: t.Input * r, Output: t.Output * r, CacheRead: t.CacheRead * r, CacheWrite: t.CacheWrite * r, CacheWrite1h: t.CacheWrite1h * r})
 	}
@@ -298,7 +375,7 @@ func (p Price) Times(r float64) Price {
 // Same is whether two prices are the same in every part and tier.
 func (p Price) Same(q Price) bool {
 	return p.Input == q.Input && p.Output == q.Output && p.CacheRead == q.CacheRead && p.CacheWrite == q.CacheWrite &&
-		p.CacheWrite1h == q.CacheWrite1h && slices.Equal(p.Tiers, q.Tiers)
+		p.CacheWrite1h == q.CacheWrite1h && slices.Equal(p.Tiers, q.Tiers) && p.Peak == q.Peak
 }
 
 // At is the flat price a request whose input, cached and cache-written
@@ -306,10 +383,10 @@ func (p Price) Same(q Price) bool {
 // tier it is over, else the base price. OpenAI counts a request's input
 // with its cached tokens in it, and bills the whole request at the tier.
 func (p Price) At(prompt int) Price {
-	flat := Price{Input: p.Input, Output: p.Output, CacheRead: p.CacheRead, CacheWrite: p.CacheWrite, CacheWrite1h: p.CacheWrite1h}
+	flat := Price{Input: p.Input, Output: p.Output, CacheRead: p.CacheRead, CacheWrite: p.CacheWrite, CacheWrite1h: p.CacheWrite1h, Peak: p.Peak}
 	for _, t := range p.Tiers {
 		if prompt > t.Above {
-			flat = Price{Input: t.Input, Output: t.Output, CacheRead: t.CacheRead, CacheWrite: t.CacheWrite, CacheWrite1h: t.CacheWrite1h}
+			flat = Price{Input: t.Input, Output: t.Output, CacheRead: t.CacheRead, CacheWrite: t.CacheWrite, CacheWrite1h: t.CacheWrite1h, Peak: p.Peak}
 		}
 	}
 	return flat
@@ -538,7 +615,7 @@ var (
 )
 
 // CachePath is where `magpie sync` stores the models.dev catalog.
-func CachePath() string { return filepath.Join(appdir.Cache(), "models.json") }
+func CachePath() string { return appdir.Join(appdir.Cache(), "models.json") }
 
 func opencodeCache() string {
 	home, _ := os.UserHomeDir()
@@ -568,9 +645,16 @@ func loadGen() (map[string]mdProvider, int) {
 	if !loaded {
 		loaded = true
 		func() {
-			for _, p := range []string{CachePath(), opencodeCache()} {
-				b, err := os.ReadFile(p)
-				if err != nil {
+			// magpie's own copy, OpenCode's, then the one magpie ships
+			// with (bundled.go): a file that can't be read or parsed is
+			// passed over for the next, never read as no catalog
+			for _, read := range []func() ([]byte, error){
+				func() ([]byte, error) { return os.ReadFile(CachePath()) },
+				func() ([]byte, error) { return os.ReadFile(opencodeCache()) },
+				func() ([]byte, error) { return bundledCatalog(), nil },
+			} {
+				b, err := read()
+				if err != nil || b == nil {
 					continue
 				}
 				var m map[string]mdProvider
@@ -592,6 +676,9 @@ func loadGen() (map[string]mdProvider, int) {
 					// deepinfra/…, xiaomi/…) votes its levels once, not
 					// once a host.
 					vote := func(who, own, by string, x mdModel) {
+						if routerIDs[who] {
+							return
+						}
 						spelt[who]++
 						if x.Name != "" && x.Name != own && x.Name != who {
 							if named[who] == nil {
@@ -790,11 +877,9 @@ func syncLock(ctx context.Context, onlyIfMissing bool) error {
 	if err := json.Unmarshal(b, &probe); err != nil || len(probe) == 0 {
 		return fmt.Errorf("models.dev: unexpected payload")
 	}
-	p := CachePath()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(p, b, 0o644); err != nil {
+	// written whole through a rename: a reader never sees it half
+	// written, and a failed write keeps the last good copy
+	if err := writeWhole(CachePath(), b, time.Time{}); err != nil {
 		return err
 	}
 	// the lab catalog beside it is best effort: without it the provider
@@ -834,6 +919,10 @@ func PriceOf(providerID, modelID string) (Price, bool) {
 // (DeepSeek's deepseek-flash is deepseek-v4.1-flash).
 func PricedBy(providers []string, id string) (Price, bool) {
 	all, at := loadGen()
+	return pricedOnce(at, 'p', providers, id, func() (Price, bool) { return pricedBy(all, at, providers, id) })
+}
+
+func pricedBy(all map[string]mdProvider, at int, providers []string, id string) (Price, bool) {
 	for _, pid := range providers {
 		if m, ok := all[pid].Models[id]; ok && m.Cost != nil {
 			return *m.Cost, true
@@ -1052,6 +1141,10 @@ func madeByOf(all map[string]mdProvider, at int, b string) *madeBy {
 // those prices it.
 func MakerPriced(prefer []string, id string) (Price, bool) {
 	all, at := loadGen()
+	return pricedOnce(at, 'm', prefer, id, func() (Price, bool) { return makerPriced(all, at, prefer, id) })
+}
+
+func makerPriced(all map[string]mdProvider, at int, prefer []string, id string) (Price, bool) {
 	b := bareID(id)
 	if r, ok := unprofiled(b); ok {
 		b = r
@@ -1261,6 +1354,18 @@ func fillNames(ms []Model, fallback []string, reserved ...Model) {
 // A model it lists under another spelling alone (normalFor) counts.
 func Knows(id string) bool {
 	return ContextOf(id) > 0 || len(EffortsOf(id)) > 0 || Thinks(id)
+}
+
+// IsOneOf reports whether the model of this id is one of ids (bare,
+// lowercase), matched as ContextOf and EffortsOf match it: by the id, a
+// relay's rename (codex-gpt-6.1-sol, a tag in brackets), another spelling,
+// or the model the user said it is the same as (UserSame). It is how a
+// rule kept for some models by name reaches them on a relay that renames
+// them.
+func IsOneOf(id string, ids map[string]bool) bool {
+	load()
+	_, ok := lookup(id, ids)
+	return ok
 }
 
 // KnowsAsWritten is Knows without another spelling (normalFor): the
@@ -1524,7 +1629,7 @@ var relayPrefixes = []string{"claude-"}
 // a model another of them lists is (openai-, databricks-, doubao-, zai-):
 // the model after it is the same model, its window, levels and images
 // included.
-var channelPrefix = regexp.MustCompile(`^[a-z]{2,24}-`)
+var channelPrefix = lazyre.New(`^[a-z]{2,24}-`)
 
 // renamed is the model a relay renamed to b, when models.dev lists none
 // by b (found), and the window the rename names, if any: a window mark
@@ -1631,7 +1736,7 @@ func ListedByBorrowed(providers []string, id string) ([]string, bool) {
 }
 
 func listedBy(providers []string, id string, providerOverrides bool) ([]string, bool) {
-	all := load()
+	all, at := loadGen()
 	b := bareID(id)
 	if r, _, ok := renamed(b); ok {
 		b = r
@@ -1651,11 +1756,8 @@ func listedBy(providers []string, id string, providerOverrides bool) ([]string, 
 	}
 	for _, want := range []string{b, cutAt(b, '('), cutAt(b, ':')} {
 		for _, pid := range providers {
-			for key, m := range all[pid].Models {
-				if bareID(key) != want {
-					continue
-				}
-				if e, ok := pick(pid, m); ok {
+			for _, key := range levelIndexOf(all, at, pid).bare[want] {
+				if e, ok := pick(pid, all[pid].Models[key]); ok {
 					return e, true
 				}
 			}
@@ -1670,14 +1772,7 @@ func listedBy(providers []string, id string, providerOverrides bool) ([]string, 
 		return nil, false
 	}
 	for _, pid := range providers {
-		var keys []string
-		for key := range all[pid].Models {
-			if SameModel(bareID(key)) == n {
-				keys = append(keys, key)
-			}
-		}
-		slices.Sort(keys)
-		for _, key := range keys {
+		for _, key := range levelIndexOf(all, at, pid).same[n] {
 			if e, ok := pick(pid, all[pid].Models[key]); ok {
 				return e, true
 			}
@@ -1686,12 +1781,57 @@ func listedBy(providers []string, id string, providerOverrides bool) ([]string, 
 	return nil, false
 }
 
+// levelIndex is a provider's model keys by what listedBy looks them up
+// by, each in key order: their id without a path or case (bare), and
+// SameModel's spelling of it (same). listedBy, asked for every model's
+// levels on each look at the providers, read every vendor's every model
+// through SameModel's regexp each time: 0.28 GB of the 2.6 GB a real
+// config allocated over 20 polls. KinEfforts looks its thinking models up
+// by their versionless shape (kin), where it split and joined every key
+// on each ask: 66 MB of 1.4 GB.
+type levelIndex struct {
+	bare, same, kin map[string][]string
+}
+
+var levelIndexes struct {
+	sync.Mutex
+	gen int
+	by  map[string]*levelIndex
+}
+
+// levelIndexOf is pid's levelIndex in all, the catalog loaded at Reset
+// count at.
+func levelIndexOf(all map[string]mdProvider, at int, pid string) *levelIndex {
+	levelIndexes.Lock()
+	defer levelIndexes.Unlock()
+	if levelIndexes.by == nil || levelIndexes.gen != at {
+		levelIndexes.gen, levelIndexes.by = at, map[string]*levelIndex{}
+	}
+	if x, ok := levelIndexes.by[pid]; ok {
+		return x
+	}
+	x := &levelIndex{bare: map[string][]string{}, same: map[string][]string{}, kin: map[string][]string{}}
+	for _, key := range slices.Sorted(maps.Keys(all[pid].Models)) {
+		b := bareID(key)
+		x.bare[b] = append(x.bare[b], key)
+		n := SameModel(b)
+		x.same[n] = append(x.same[n], key)
+		if m := all[pid].Models[key]; (m.Thinks || len(m.efforts("")) > 0) && !m.budgeted() {
+			if s, ok := versionless(b); ok {
+				x.kin[s] = append(x.kin[s], key)
+			}
+		}
+	}
+	levelIndexes.by[pid] = x
+	return x
+}
+
 // variantSuffix is a word a proxy puts after a model's id to name the
 // level or speed it serves the model at: CLIProxyAPI's Antigravity
 // channel lists gemini-3.8-flash-high, claude-opus-5-5-high,
 // claude-opus-4-6-thinking and gpt-oss-120b-medium, and its xAI channel
 // grok-3-mini-fast. Its "(high)" form is found's.
-var variantSuffix = regexp.MustCompile(`(?i)-(minimal|low|medium|high|xhigh|max|thinking|fast)$`)
+var variantSuffix = lazyre.New(`(?i)-(minimal|low|medium|high|xhigh|max|thinking|fast)$`)
 
 // Unsuffixed is id with a proxy's level or speed word taken off
 // (variantSuffix), and whether it had one. It is for borrowing levels a
@@ -1710,7 +1850,7 @@ func Unsuffixed(id string) (string, bool) {
 // from mimo-v2.6-flash): a model newer than the catalog on this machine
 // offers its line's levels, not none. False when none of them has one.
 func KinEfforts(providers []string, id string) ([]string, bool) {
-	all := load()
+	all, at := loadGen()
 	shape, ok := versionless(bareID(id))
 	if !ok {
 		return nil, false
@@ -1721,13 +1861,8 @@ func KinEfforts(providers []string, id string) ([]string, bool) {
 		found              bool
 	)
 	for _, pid := range providers {
-		for key, m := range all[pid].Models {
-			if !m.Thinks && len(m.efforts("")) == 0 || m.budgeted() {
-				continue
-			}
-			if s, ok := versionless(bareID(key)); !ok || s != shape {
-				continue
-			}
+		for _, key := range levelIndexOf(all, at, pid).kin[shape] {
+			m := all[pid].Models[key]
 			// the newest; of two the same day, the first provider's, then
 			// the greater id, whatever order the map gives
 			if !found || m.ReleaseDate > newest || m.ReleaseDate == newest && pid == from && key > name {
@@ -1809,6 +1944,17 @@ func mostGiven(by map[int]int) int {
 	return best
 }
 
+// routerIDs are ids that name a vendor's router, not a model: OpenRouter's
+// openrouter/auto, model-oracle-ai's auto, Kilo's kilo-auto/free and the
+// rest are each their own, and a plugin's "auto" (豆包工作 picks Doubao's
+// model) is none of them. Without a path they were taken for one model,
+// and every provider's "auto" was given that model's levels, images and
+// window: pi offered thinking levels and image input for 豆包工作's auto.
+// What a provider's own list says of its router (ListedBy) still holds.
+// Only ids no vendor gives a model are here: "fast" and "balanced" are
+// trustedrouter's and Kilo's routers, but a vendor may name a model so.
+var routerIDs = map[string]bool{"auto": true, "default": true, "free": true}
+
 // bareID is a model's id without the vendor's prefix, lowercase.
 func bareID(id string) string {
 	id = strings.ToLower(id)
@@ -1832,6 +1978,38 @@ func unprofiled(b string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// The APIs a model Serves is made for.
+const (
+	ServesEmbedding     = "embedding"
+	ServesRerank        = "rerank"
+	ServesSpeech        = "speech"
+	ServesTranscription = "transcription"
+)
+
+// ServesOf is the API a model's id says it is made for, other than chat,
+// images or video: "" for any other model. Read from the id alone, as
+// vendors' OpenAI-style lists say no more (text-embedding-3-small,
+// bge-reranker-v2-m3, tts-1, gpt-4o-mini-tts, whisper-1,
+// gpt-4o-transcribe). Voyage AI makes embedding models alone, and names
+// them voyage-* (voyage-4, voyage-code-3), with no "embed" in the id.
+func ServesOf(id string) string {
+	id = strings.ToLower(id)
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		id = id[i+1:]
+	}
+	switch {
+	case strings.Contains(id, "rerank"):
+		return ServesRerank
+	case strings.Contains(id, "embed") || strings.HasPrefix(id, "bge-") || strings.HasPrefix(id, "voyage-"):
+		return ServesEmbedding
+	case strings.Contains(id, "whisper") || strings.Contains(id, "transcribe"):
+		return ServesTranscription
+	case strings.HasPrefix(id, "tts-") || strings.Contains(id, "-tts"):
+		return ServesSpeech
+	}
+	return ""
 }
 
 func textModel(m mdModel) bool {
@@ -1888,15 +2066,29 @@ func DrawsID(id string) bool {
 
 // ImagesAPI is whether a model draws on an images API rather than answering
 // in chat with pictures: gpt-image, dall-e, imagen, flux, seedream… — not
-// gemini-*-image or gpt-5-image, which chat.
+// gemini-*-image or gpt-5-image, which chat. iFlytek Loomy's Hy-Image
+// generators (Hy-Image-3.5-preview) draw on its images API too (#4913).
 func ImagesAPI(id string) bool {
 	id = strings.ToLower(id)
-	for _, w := range []string{"gpt-image", "chatgpt-image", "dall-e", "imagen", "imagine", "qwen-image", "wanx", "wan2", "seedream", "cogview", "flux", "stable-diffusion", "sdxl", "kolors", "hidream", "sensenova-u1"} {
+	for _, w := range []string{"gpt-image", "chatgpt-image", "dall-e", "imagen", "imagine", "qwen-image", "wanx", "wan2", "seedream", "cogview", "flux", "stable-diffusion", "sdxl", "kolors", "hidream", "sensenova-u1", "hy-image"} {
 		if strings.Contains(id, w) {
 			return true
 		}
 	}
 	return false
+}
+
+// FilmsID is whether a model's id names one that makes videos, for a model
+// whose list says nothing of a kind: OpenAI's sora-2 and sora-2-pro are
+// made at its OpenAI-shaped videos API, which the gateway speaks, but
+// textModel counts their ids out of the chat models, and a list that
+// marks no kind left them unlisted at all — never offered to talk to, and
+// never marked a video model in the provider's editor (#4954). The other
+// video families keep the faces their own APIs are asked on: Ark's
+// Seedance at its tasks (gateway arkVideoModel), a MiniMax key's H3
+// (video_minimax.go), and a model the user says makes videos (#1399).
+func FilmsID(id string) bool {
+	return strings.Contains(strings.ToLower(id), "sora")
 }
 
 // PointsToImagesAPI is whether a vendor's refusal of a chat request names
@@ -2078,9 +2270,13 @@ func CodexModelsCache() string { return filepath.Join(CodexHome(), "models_cache
 
 // Codex returns the models Codex itself lists, straight from the cache the
 // Codex CLI writes; there is no compiled-in list to fall back to.
-func Codex() []Model {
+func Codex() []Model { return slices.Clone(CodexShared()) }
+
+// CodexShared is Codex's list without a copy, for a caller that only
+// reads it: the effort field asks for it on every poll.
+func CodexShared() []Model {
 	out, _ := filememo.Read("codex models", CodexModelsCache(), parseCodex)
-	return slices.Clone(out)
+	return out
 }
 
 func parseCodex(b []byte) ([]Model, error) {

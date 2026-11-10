@@ -41,18 +41,22 @@ package agent
 // and so does a config split with $include.
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/jsonc"
 
+	"github.com/yetone/magpie/internal/capre"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 )
 
 // what OpenClaw says after a change (notice.go)
@@ -72,7 +76,7 @@ const (
 )
 
 // openClawProfile is a profile name OpenClaw takes (profile-utils.ts).
-var openClawProfile = regexp.MustCompile(`(?i)^[a-z0-9][a-z0-9_-]{0,63}$`)
+var openClawProfile = capre.MustCompile(`(?i)^[a-z0-9][a-z0-9_-]*$`, 64)
 
 // openClawHome is OpenClaw's ~: $OPENCLAW_HOME, a leading ~ in it the
 // system's home (resolveEffectiveHomeDir).
@@ -123,7 +127,27 @@ func openClawRead(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(strings.TrimSpace(string(b))) == 0 {
+	return openClawPlain(path, b)
+}
+
+// openClawLook is openClawRead for a look that writes nothing (the
+// model's Get, Check), which every drift poll makes: the file is made
+// plain JSON and checked once a change, and the bytes are shared, so read
+// only.
+func openClawLook(path string) ([]byte, error) {
+	s, err := filememo.Read("openclaw json", path, func(b []byte) ([]byte, error) {
+		return openClawPlain(path, edit.TrimBOM(b))
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return s, err
+}
+
+// openClawPlain is b, OpenClaw's file, made plain JSON in a copy of its
+// own, or nil for an empty file.
+func openClawPlain(path string, b []byte) ([]byte, error) {
+	if len(bytes.TrimSpace(b)) == 0 {
 		return nil, nil
 	}
 	s := jsonc.ToJSONInPlace(append([]byte(nil), b...))
@@ -159,7 +183,7 @@ func openClawWant(raw gjson.Result) []any {
 		}
 	}
 	out := []any{}
-	for _, m := range magpieModels("openclaw") {
+	for _, m := range sharedModels("openclaw") {
 		ctx := m.Context
 		if ctx <= 0 {
 			ctx = openClawContext
@@ -220,7 +244,7 @@ func openClawAt(at place) *Agent {
 	dir, path := openClawPaths(at)
 	keyWas := at.key("openclaw:" + path + ":model")
 	read := func() gjson.Result {
-		s, _ := openClawRead(path)
+		s, _ := openClawLook(path)
 		return gjson.ParseBytes(s)
 	}
 	ours := func(c gjson.Result) bool { return prefixed(openClawPrimary(c.Get(openClawModel))) }
@@ -389,7 +413,7 @@ func openClawAt(at place) *Agent {
 		}
 		c := gjson.ParseBytes(s)
 		var was openClawWas
-		if b := stashLoad()[keyWas]; b != "" {
+		if b := stashShared()[keyWas]; b != "" {
 			json.Unmarshal([]byte(b), &was)
 		} else if !ours(c) {
 			m := c.Get(openClawModel)
@@ -416,7 +440,8 @@ func openClawAt(at place) *Agent {
 	return atomic(&Agent{
 		ID: "openclaw", Name: "OpenClaw", Icon: "openclaw", Spelled: prefixed, NoNames: true,
 		Bin: "openclaw", Dir: dir, Path: path,
-		Notice: func() string { return noticeOpenClaw.String() },
+		Notice:   func() string { return noticeOpenClaw.String() },
+		ListOnly: true,
 		Sync: func() error {
 			s, err := openClawRead(path)
 			if err != nil {
@@ -433,7 +458,7 @@ func openClawAt(at place) *Agent {
 			return patch(set, del)
 		},
 		Check: func() string {
-			s, err := openClawRead(path)
+			s, err := openClawLook(path)
 			if err != nil {
 				return err.Error()
 			}
@@ -477,7 +502,7 @@ func openClawAt(at place) *Agent {
 				return patch([]edit.KV{{Path: openClawModel, Value: v}}, nil)
 			},
 			Options: func(cur map[string]string) []Option {
-				return append(openClawOwn(keyWas, cur["model"]), viaMagpie("openclaw", magpieID+"/")...)
+				return withVia(openClawOwn(keyWas, cur["model"]), "openclaw", magpieID+"/")
 			},
 		}},
 	}, path)
@@ -488,7 +513,7 @@ func openClawAt(at place) *Agent {
 // which magpie can't list.
 func openClawOwn(keyWas, cur string) []Option {
 	var was openClawWas
-	json.Unmarshal([]byte(stashLoad()[keyWas]), &was)
+	json.Unmarshal([]byte(stashShared()[keyWas]), &was)
 	var out []Option
 	for _, m := range []string{openClawPrimary(gjson.ParseBytes(was.Model)), cur} {
 		if m == "" || prefixed(m) || slices.ContainsFunc(out, func(o Option) bool { return o.Value == m }) {

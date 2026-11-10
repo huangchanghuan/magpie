@@ -3,10 +3,11 @@ package provider
 import (
 	"cmp"
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -67,7 +68,7 @@ const (
 
 // nonChat are words of a model id that isn't for an agent's chat: it
 // draws, speaks, listens, embeds or searches rather than answering a turn.
-var nonChat = regexp.MustCompile(`embed|rerank|image|imagen|dall-e|tts|whisper|audio|realtime|transcribe|moderation|ocr|veo|sora|speech|research|guard|computer-use`)
+var nonChat = lazyre.New(`embed|rerank|image|imagen|dall-e|tts|whisper|audio|realtime|transcribe|moderation|ocr|veo|sora|speech|research|guard|computer-use`)
 
 // smallWords are words of a cheap model's id; tinyWords those of one too
 // small to be trusted with an agent's turn when a larger cheap one is
@@ -76,7 +77,7 @@ var nonChat = regexp.MustCompile(`embed|rerank|image|imagen|dall-e|tts|whisper|a
 var (
 	smallWords = []string{"mini", "nano", "flash", "haiku", "lite", "small", "air", "turbo", "fast", "instant", "tiny", "highspeed"}
 	tinyWords  = []string{"nano", "lite", "tiny"}
-	sizeWord   = regexp.MustCompile(`^(\d+(?:\.\d+)?)b$`)
+	sizeWord   = lazyre.New(`^(\d+(?:\.\d+)?)b$`)
 )
 
 // sizeOf is how small a model's id says it is: small, and tiny.
@@ -131,7 +132,9 @@ func templateModels() []rated {
 		r := rated{e: e}
 		if pr, ok := MakerPrice(e.Model); ok {
 			r.out, r.maker = pr.Output, true
-		} else if pr, ok := priceOf(s, e.Provider, true, e.Model); ok {
+		} else if pr, ok := priceOf(s, e.Provider, true, e.Model, time.Time{}); ok {
+			// without a rate window's rate (#2463): a template weighs how
+			// strong a model is, which the hour it is made in doesn't change
 			r.out = pr.Output
 		}
 		r.small, r.tiny = sizeOf(e.Model)
